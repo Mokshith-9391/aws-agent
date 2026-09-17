@@ -1,0 +1,43 @@
+# Environment
+.env
+.env.local
+.env.production
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+*.so
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Logs
+logs/
+*.log
+
+# History data
+history/data/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Secrets
+*.pem
+*.key
+credentials
