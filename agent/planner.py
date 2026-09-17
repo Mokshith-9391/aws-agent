@@ -2,8 +2,9 @@
 AWS Resource Planner.
 
 The core planning engine that takes user requests, interacts with the LLM
-to produce structured provisioning plans, and validates/enriches the plans
-with service registry metadata and existing resource context.
+to produce structured desired-state provisioning plans, and deterministically
+builds and enriches commands, logical resource references, and dependencies.
+Never trusts LLM for operation categories or arbitrary AMI IDs.
 """
 
 from __future__ import annotations
@@ -17,27 +18,32 @@ from typing import Any, Optional
 
 from agent.llm_client import LLMClient
 from agent.models import (
+    ApprovalType,
     CLICommand,
     ExecutionStatus,
+    LogicalResource,
     OperationCategory,
     OperationType,
     ProvisioningPlan,
     ResourceConfig,
+    ResourceOwnership,
     RiskLevel,
     RollbackStep,
 )
-from agent.prompts import build_plan_prompt, build_system_prompt, build_missing_info_prompt
+from agent.prompts import build_missing_info_prompt, build_plan_prompt, build_system_prompt
+from aws.ami_discovery import AMIDiscovery
+from aws.cli_validator import classify_aws_action
 from services.registry import AWSServiceRegistry
 
 logger = logging.getLogger(__name__)
 
 
 class Planner:
-    """
-    Generates structured provisioning plans from natural-language requests.
+    """Generates structured provisioning plans from natural-language requests.
 
-    Uses the LLM for reasoning and the service registry for validation.
-    The plan is always a structured Pydantic model, never raw LLM text.
+    Uses the LLM for high-level reasoning and desired-state definition,
+    and deterministic application code for command construction, category
+    classification, and AMI discovery.
     """
 
     def __init__(
@@ -47,6 +53,7 @@ class Planner:
     ) -> None:
         self._llm = llm_client
         self._registry = service_registry
+        self._ami_discovery = AMIDiscovery()
 
     def generate_plan(
         self,
@@ -61,18 +68,18 @@ class Planner:
         """Generate a provisioning plan from a natural-language request.
 
         Args:
-            user_request: The user's natural-language request.
+            user_request: Natural language request.
             region: Target AWS region.
             account_id: AWS account ID for context.
-            profile: AWS profile name.
-            conversation_history: Previous conversation messages.
-            session_resources: Previously created resource IDs.
-            existing_resources: Description of existing AWS resources.
+            profile: Target AWS CLI profile.
+            conversation_history: Prior conversation turns.
+            session_resources: Known session resource IDs.
+            existing_resources: Summary of discovered resources.
 
         Returns:
-            A validated ProvisioningPlan.
+            A validated ProvisioningPlan with deterministic command classifications.
         """
-        logger.info(f"Generating plan for request: {user_request[:100]}...")
+        logger.info("Generating plan for request: %s (profile=%s, region=%s)", user_request[:100], profile, region)
 
         # Build context
         services_context = json.dumps(self._registry.get_service_summary(), indent=2)
@@ -81,7 +88,7 @@ class Planner:
         if conversation_history:
             history_text = "\n".join(
                 f"{msg.get('role', 'user')}: {msg.get('content', '')[:200]}"
-                for msg in conversation_history[-10:]  # Last 10 messages
+                for msg in conversation_history[-10:]
             )
 
         resources_text = "None"
@@ -90,7 +97,6 @@ class Planner:
                 f"- {k}: {v}" for k, v in session_resources.items()
             )
 
-        # Build prompts
         system_prompt = build_system_prompt(
             services_context=services_context,
             account_id=account_id,
@@ -106,7 +112,6 @@ class Planner:
             session_resources=resources_text,
         )
 
-        # Call LLM
         try:
             raw_response = self._llm.generate(
                 system_prompt=system_prompt,
@@ -114,25 +119,22 @@ class Planner:
                 temperature=0.1,
                 response_format="json",
             )
-            logger.debug(f"LLM raw response length: {len(raw_response)}")
+            logger.debug("LLM raw response length: %d", len(raw_response))
         except Exception as e:
-            logger.error(f"LLM call failed: {e}")
-            return self._create_error_plan(user_request, region, str(e))
+            logger.error("LLM call failed: %s", e)
+            return self._create_error_plan(user_request, region, profile, str(e))
 
         # Parse LLM response into structured plan
-        plan = self._parse_llm_response(raw_response, user_request, region, account_id)
+        plan = self._parse_llm_response(raw_response, user_request, region, profile, account_id)
 
-        # Enrich and validate the plan
-        plan = self._enrich_plan(plan, region)
+        # Enrich and validate deterministically
+        plan = self._enrich_plan(plan, region, profile)
         plan = self._validate_plan(plan)
 
         logger.info(
-            f"Plan generated: {plan.plan_id} | "
-            f"intent={plan.intent} | "
-            f"commands={len(plan.commands)} | "
-            f"risk={plan.risk_level}"
+            "Plan generated: %s | intent=%s | commands=%d | risk=%s | category=%s",
+            plan.plan_id, plan.intent, len(plan.commands), plan.risk_level.value, plan.operation_category.value
         )
-
         return plan
 
     def _parse_llm_response(
@@ -140,52 +142,120 @@ class Planner:
         raw_response: str,
         user_request: str,
         region: str,
+        profile: str,
         account_id: str,
     ) -> ProvisioningPlan:
-        """Parse the LLM JSON response into a ProvisioningPlan.
-
-        Args:
-            raw_response: Raw JSON string from the LLM.
-            user_request: Original user request.
-            region: Target AWS region.
-            account_id: AWS account ID.
-
-        Returns:
-            Parsed ProvisioningPlan.
-        """
+        """Parse the LLM JSON response into a ProvisioningPlan."""
         try:
-            # Clean the response - remove markdown code blocks if present
             cleaned = raw_response.strip()
             if cleaned.startswith("```"):
-                # Remove opening ``` line
                 cleaned = re.sub(r"^```(?:json)?\s*\n?", "", cleaned)
-                # Remove closing ```
                 cleaned = re.sub(r"\n?```\s*$", "", cleaned)
 
             data = json.loads(cleaned)
         except json.JSONDecodeError as e:
-            logger.error(f"Failed to parse LLM JSON response: {e}")
-            logger.debug(f"Raw response: {raw_response[:500]}")
+            logger.error("Failed to parse LLM JSON response: %s", e)
             return self._create_error_plan(
-                user_request, region,
-                f"Failed to parse the AI response. Please try rephrasing your request."
+                user_request, region, profile,
+                "Failed to parse the AI response as JSON. Please rephrase your request."
             )
 
-        # Map LLM output to Pydantic model
         try:
-            # Parse operation type
             op_type_str = data.get("operation_type", "create").lower()
             try:
                 operation_type = OperationType(op_type_str)
             except ValueError:
                 operation_type = OperationType.CREATE
 
-            # Parse operation category
-            op_cat_str = data.get("operation_category", "WRITE").upper()
-            try:
-                operation_category = OperationCategory(op_cat_str)
-            except ValueError:
-                operation_category = OperationCategory.WRITE
+            # Parse resources
+            resources = []
+            logical_resources = []
+            for r in data.get("resources", []):
+                svc = r.get("service", "")
+                rtype = r.get("resource_type", "")
+                rname = r.get("resource_name")
+                ref = r.get("logical_ref") or f"{svc}.{rtype}"
+                resources.append(ResourceConfig(
+                    service=svc,
+                    resource_type=rtype,
+                    resource_name=rname,
+                    configuration=r.get("configuration", {}),
+                    dependencies=r.get("dependencies", []),
+                    tags=r.get("tags", {}),
+                    logical_ref=ref,
+                ))
+                logical_resources.append(LogicalResource(
+                    resource_ref=ref,
+                    resource_type=rtype,
+                    service=svc,
+                    resource_name=rname,
+                    ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
+                ))
+
+            # Parse commands with AUTHORITATIVE deterministic category classification
+            commands: list[CLICommand] = []
+            for c in data.get("commands", []):
+                svc = c.get("service", "")
+                act = c.get("action", "")
+                # Critical Fix #2: Deterministic category mapping based on service & action
+                authoritative_cat = classify_aws_action(svc, act)
+
+                cmd = CLICommand(
+                    command_id=c.get("command_id", str(uuid.uuid4())[:8]),
+                    service=svc,
+                    action=act,
+                    parameters=c.get("parameters", {}),
+                    region=c.get("region", region),
+                    profile=profile,
+                    description=c.get("description", ""),
+                    operation_category=authoritative_cat,
+                    resource_ref=c.get("resource_ref"),
+                    depends_on=c.get("depends_on", []),
+                    output_key=c.get("output_key"),
+                )
+                commands.append(cmd)
+
+            # Determine plan-level operation category deterministically
+            if any(cmd.operation_category == OperationCategory.DESTRUCTIVE for cmd in commands):
+                overall_category = OperationCategory.DESTRUCTIVE
+            elif any(cmd.operation_category == OperationCategory.WRITE for cmd in commands):
+                overall_category = OperationCategory.WRITE
+            else:
+                overall_category = OperationCategory.READ_ONLY
+
+            # Parse verification commands
+            verification_steps: list[CLICommand] = []
+            for v in data.get("verification_commands", []):
+                ver_cmd = CLICommand(
+                    command_id=f"verify-{uuid.uuid4().hex[:6]}",
+                    service=v.get("service", ""),
+                    action=v.get("action", ""),
+                    parameters=v.get("parameters", {}),
+                    region=region,
+                    profile=profile,
+                    description=v.get("description", "Verify resource state"),
+                    operation_category=OperationCategory.READ_ONLY,
+                )
+                verification_steps.append(ver_cmd)
+
+            # Parse rollback commands
+            rollback_strategy: list[RollbackStep] = []
+            for i, rb in enumerate(data.get("rollback_commands", [])):
+                rb_cmd = CLICommand(
+                    command_id=f"rollback-{uuid.uuid4().hex[:6]}",
+                    service=rb.get("service", ""),
+                    action=rb.get("action", ""),
+                    parameters=rb.get("parameters", {}),
+                    region=region,
+                    profile=profile,
+                    description=rb.get("description", "Rollback operation"),
+                    operation_category=OperationCategory.DESTRUCTIVE,
+                )
+                rollback_strategy.append(RollbackStep(
+                    order=i + 1,
+                    resource_description=rb.get("resource_description", rb.get("description", "")),
+                    command=rb_cmd,
+                ))
 
             # Parse risk level
             risk_str = data.get("risk_level", "MEDIUM").upper()
@@ -194,228 +264,102 @@ class Planner:
             except ValueError:
                 risk_level = RiskLevel.MEDIUM
 
-            # Parse resources
-            resources = []
-            for r in data.get("resources", []):
-                resources.append(ResourceConfig(
-                    service=r.get("service", ""),
-                    resource_type=r.get("resource_type", ""),
-                    resource_name=r.get("resource_name"),
-                    configuration=r.get("configuration", {}),
-                    dependencies=r.get("dependencies", []),
-                    tags=r.get("tags", {}),
-                ))
+            # If destructive, elevate risk to HIGH minimum
+            if overall_category == OperationCategory.DESTRUCTIVE and risk_level == RiskLevel.LOW:
+                risk_level = RiskLevel.HIGH
 
-            # Parse commands
-            commands = []
-            for i, c in enumerate(data.get("commands", [])):
-                cmd_cat_str = c.get("operation_category", "WRITE").upper()
-                try:
-                    cmd_category = OperationCategory(cmd_cat_str)
-                except ValueError:
-                    cmd_category = OperationCategory.WRITE
-
-                cmd = CLICommand(
-                    command_id=c.get("command_id", str(uuid.uuid4())[:8]),
-                    service=c.get("service", ""),
-                    action=c.get("action", ""),
-                    parameters=c.get("parameters", {}),
-                    region=c.get("region", region),
-                    description=c.get("description", ""),
-                    operation_category=cmd_category,
-                    resource_ref=c.get("resource_ref"),
-                    depends_on=c.get("depends_on", []),
-                    output_key=c.get("output_key"),
-                )
-                commands.append(cmd)
-
-            # Parse verification commands
-            verification_steps = []
-            for v in data.get("verification_commands", []):
-                ver_cmd = CLICommand(
-                    command_id=f"verify-{uuid.uuid4().hex[:6]}",
-                    service=v.get("service", ""),
-                    action=v.get("action", ""),
-                    parameters=v.get("parameters", {}),
-                    region=region,
-                    description=v.get("description", "Verify resource"),
-                    operation_category=OperationCategory.READ_ONLY,
-                )
-                verification_steps.append(ver_cmd)
-
-            # Parse rollback commands
-            rollback_strategy = []
-            for i, rb in enumerate(data.get("rollback_commands", [])):
-                rb_cat_str = rb.get("operation_category", "DESTRUCTIVE").upper()
-                try:
-                    rb_category = OperationCategory(rb_cat_str)
-                except ValueError:
-                    rb_category = OperationCategory.DESTRUCTIVE
-
-                rb_cmd = CLICommand(
-                    service=rb.get("service", ""),
-                    action=rb.get("action", ""),
-                    parameters=rb.get("parameters", {}),
-                    region=region,
-                    description=rb.get("description", "Rollback"),
-                    operation_category=rb_category,
-                )
-                rollback_strategy.append(RollbackStep(
-                    order=len(data.get("rollback_commands", [])) - i,
-                    resource_description=rb.get("description", ""),
-                    command=rb_cmd,
-                ))
-
-            plan = ProvisioningPlan(
+            return ProvisioningPlan(
                 user_request=user_request,
-                intent=data.get("intent", "Unknown intent"),
+                intent=data.get("intent", user_request),
                 operation_type=operation_type,
-                operation_category=operation_category,
-                aws_region=data.get("aws_region", region),
+                operation_category=overall_category,
+                aws_profile=profile,
+                aws_region=region,
                 aws_account_id=account_id,
                 resources=resources,
+                logical_resources=logical_resources,
                 dependencies=data.get("dependencies", []),
                 commands=commands,
                 risk_level=risk_level,
-                destructive_operations=data.get("destructive_operations", False),
+                destructive_operations=(overall_category == OperationCategory.DESTRUCTIVE),
                 missing_parameters=data.get("missing_parameters", []),
                 assumptions=data.get("assumptions", []),
-                requires_approval=data.get("requires_approval", True),
+                requires_approval=(overall_category != OperationCategory.READ_ONLY),
                 rollback_strategy=rollback_strategy,
                 verification_steps=verification_steps,
                 cost_warnings=data.get("cost_warnings", []),
                 educational_notes=data.get("educational_notes", []),
             )
 
-            return plan
-
         except Exception as e:
-            logger.error(f"Failed to construct plan from parsed data: {e}", exc_info=True)
-            return self._create_error_plan(
-                user_request, region,
-                f"Failed to construct the provisioning plan: {e}"
-            )
+            logger.error("Error creating plan from parsed JSON: %s", e, exc_info=True)
+            return self._create_error_plan(user_request, region, profile, f"Plan creation error: {e}")
 
-    def _enrich_plan(self, plan: ProvisioningPlan, region: str) -> ProvisioningPlan:
-        """Enrich the plan with service registry metadata.
-
-        Adds cost warnings, IAM permissions info, and validates
-        service/resource types against the registry.
-
-        Args:
-            plan: The plan to enrich.
-            region: Target AWS region.
-
-        Returns:
-            Enriched plan.
-        """
-        # Ensure region is set on all commands
+    def _enrich_plan(self, plan: ProvisioningPlan, region: str, profile: str) -> ProvisioningPlan:
+        """Deterministically enrich the plan: resolve AMIs, cost warnings, and tags."""
+        # 1. Deterministic AMI Discovery for EC2 instances
         for cmd in plan.commands:
-            if not cmd.region:
-                cmd.region = region
+            if cmd.service == "ec2" and cmd.action == "run-instances":
+                curr_ami = cmd.parameters.get("image-id")
+                # If AMI is missing, or looks like a placeholder, or user requested Amazon Linux
+                if not curr_ami or "ami-" not in curr_ami or "placeholder" in curr_ami.lower() or "012345" in curr_ami:
+                    discovered_ami, rationale = self._ami_discovery.discover_amazon_linux_2023(
+                        region=region, profile=profile, query_live=False
+                    )
+                    if discovered_ami:
+                        cmd.parameters["image-id"] = discovered_ami
+                        plan.assumptions.append(rationale)
 
-        # Add cost warnings from service registry
-        for resource in plan.resources:
-            rt_def = self._registry.get_resource_type(resource.service, resource.resource_type)
+        # 2. Enrich Cost Warnings from Service Registry
+        for res in plan.resources:
+            rt_def = self._registry.get_resource_type(res.service, res.resource_type)
             if rt_def and rt_def.cost_warning:
                 if rt_def.cost_warning not in plan.cost_warnings:
                     plan.cost_warnings.append(rt_def.cost_warning)
 
-        # Ensure destructive_operations flag is accurate
-        if plan.has_destructive_commands:
-            plan.destructive_operations = True
-            if plan.risk_level in (RiskLevel.LOW, RiskLevel.MEDIUM):
-                plan.risk_level = RiskLevel.HIGH
-
-        # Set approval requirements
-        if plan.operation_category == OperationCategory.READ_ONLY:
-            plan.requires_approval = False
-        elif plan.operation_category == OperationCategory.DESTRUCTIVE:
-            plan.requires_approval = True
-            if plan.risk_level == RiskLevel.LOW:
-                plan.risk_level = RiskLevel.MEDIUM
-        elif plan.operation_category == OperationCategory.WRITE:
-            plan.requires_approval = True
+        # 3. Propagate profile and region to all commands
+        for cmd in plan.commands:
+            cmd.profile = profile
+            if not cmd.region:
+                cmd.region = region
 
         return plan
 
     def _validate_plan(self, plan: ProvisioningPlan) -> ProvisioningPlan:
-        """Validate the plan for correctness.
+        """Validate logical completeness and assign missing parameters."""
+        for res in plan.resources:
+            rt_def = self._registry.get_resource_type(res.service, res.resource_type)
+            if not rt_def:
+                continue
 
-        Args:
-            plan: The plan to validate.
+            for req_param in rt_def.required_params:
+                # Check if param appears in resource config or associated command
+                param_found = req_param in res.configuration
+                if not param_found:
+                    for cmd in plan.commands:
+                        if cmd.service == rt_def.cli_service and req_param in cmd.parameters:
+                            param_found = True
+                            break
 
-        Returns:
-            Validated plan (may have updated missing_parameters).
-        """
-        # Check that all commands have a service and action
-        for cmd in plan.commands:
-            if not cmd.service:
-                plan.missing_parameters.append(f"Command missing service: {cmd.description}")
-            if not cmd.action:
-                plan.missing_parameters.append(f"Command missing action: {cmd.description}")
-
-        # Check that S3 buckets in non-us-east-1 have LocationConstraint
-        for cmd in plan.commands:
-            if (
-                cmd.service == "s3api"
-                and cmd.action == "create-bucket"
-                and plan.aws_region != "us-east-1"
-            ):
-                params = cmd.parameters
-                if "create-bucket-configuration" not in params:
-                    params["create-bucket-configuration"] = f"LocationConstraint={plan.aws_region}"
+                if not param_found:
+                    missing_msg = f"Missing required parameter '{req_param}' for {res.service} {res.resource_type}"
+                    if missing_msg not in plan.missing_parameters:
+                        plan.missing_parameters.append(missing_msg)
 
         return plan
 
     def _create_error_plan(
-        self, user_request: str, region: str, error_msg: str
+        self, user_request: str, region: str, profile: str, error_message: str
     ) -> ProvisioningPlan:
-        """Create an error plan when planning fails.
-
-        Args:
-            user_request: Original user request.
-            region: Target region.
-            error_msg: Error message.
-
-        Returns:
-            A plan with the error in missing_parameters.
-        """
+        """Create a safe fallback plan containing diagnostic error info."""
         return ProvisioningPlan(
             user_request=user_request,
-            intent="Error during planning",
-            operation_type=OperationType.READ,
+            intent=f"Error planning request: {user_request[:50]}",
+            operation_type=OperationType.CREATE,
             operation_category=OperationCategory.READ_ONLY,
+            aws_profile=profile,
             aws_region=region,
-            missing_parameters=[f"Planning error: {error_msg}"],
+            missing_parameters=[f"Planning error: {error_message}"],
+            assumptions=["An error occurred during plan generation. Please rephrase your request."],
             requires_approval=False,
         )
-
-    def generate_missing_info_message(
-        self, user_request: str, missing_params: list[str]
-    ) -> str:
-        """Generate a friendly message asking for missing information.
-
-        Args:
-            user_request: Original user request.
-            missing_params: List of missing parameters.
-
-        Returns:
-            Friendly message string.
-        """
-        try:
-            prompt = build_missing_info_prompt(user_request, missing_params)
-            response = self._llm.generate(
-                system_prompt="You are a helpful AWS assistant. Generate a friendly, concise message.",
-                user_prompt=prompt,
-                temperature=0.3,
-            )
-            return response
-        except Exception as e:
-            logger.error(f"Failed to generate missing info message: {e}")
-            # Fallback to a simple message
-            params_text = "\n".join(f"  - {p}" for p in missing_params)
-            return (
-                f"I need a bit more information to proceed:\n\n{params_text}\n\n"
-                f"Could you please provide these details?"
-            )

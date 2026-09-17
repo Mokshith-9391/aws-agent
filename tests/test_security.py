@@ -53,6 +53,124 @@ class TestSafetyPolicy:
         )
         assert self.engine.requires_explicit_confirmation(plan)
 
+    def test_iam_wildcard_policy_blocked(self):
+        policy_doc = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {
+                    "Effect": "Allow",
+                    "Action": "*",
+                    "Resource": "*"
+                }
+            ]
+        }
+        plan = ProvisioningPlan(
+            user_request="Create admin policy",
+            intent="Create policy",
+            operation_type=OperationType.CREATE,
+            operation_category=OperationCategory.WRITE,
+            aws_region="ap-south-1",
+            commands=[
+                CLICommand(
+                    service="iam",
+                    action="create-policy",
+                    parameters={"policy-name": "BadAdmin", "policy-document": policy_doc},
+                    description="Wildcard policy",
+                    operation_category=OperationCategory.WRITE,
+                )
+            ]
+        )
+        is_safe, warnings, blocking = self.engine.evaluate_plan(plan)
+        assert not is_safe
+        assert any("wildcard" in b.lower() for b in blocking)
+
+    def test_iam_admin_access_blocked(self):
+        plan = ProvisioningPlan(
+            user_request="Attach admin",
+            intent="Attach admin",
+            operation_type=OperationType.CREATE,
+            operation_category=OperationCategory.WRITE,
+            aws_region="ap-south-1",
+            commands=[
+                CLICommand(
+                    service="iam",
+                    action="attach-role-policy",
+                    parameters={"role-name": "TestRole", "policy-arn": "arn:aws:iam::aws:policy/AdministratorAccess"},
+                    description="Admin attach",
+                    operation_category=OperationCategory.WRITE,
+                )
+            ]
+        )
+        is_safe, warnings, blocking = self.engine.evaluate_plan(plan)
+        assert not is_safe
+        assert any("administratoraccess" in b.lower() for b in blocking)
+
+    def test_open_all_ports_blocked(self):
+        plan = ProvisioningPlan(
+            user_request="Open all ports",
+            intent="Open all ports",
+            operation_type=OperationType.CREATE,
+            operation_category=OperationCategory.WRITE,
+            aws_region="ap-south-1",
+            commands=[
+                CLICommand(
+                    service="ec2",
+                    action="authorize-security-group-ingress",
+                    parameters={"group-name": "open-sg", "protocol": "-1", "cidr": "0.0.0.0/0"},
+                    description="Open everything",
+                    operation_category=OperationCategory.WRITE,
+                )
+            ]
+        )
+        is_safe, warnings, blocking = self.engine.evaluate_plan(plan)
+        assert not is_safe
+        assert any("opening all ports" in b.lower() for b in blocking)
+
+    def test_ssh_port_warning(self):
+        plan = ProvisioningPlan(
+            user_request="Open SSH to world",
+            intent="Open SSH",
+            operation_type=OperationType.CREATE,
+            operation_category=OperationCategory.WRITE,
+            aws_region="ap-south-1",
+            commands=[
+                CLICommand(
+                    service="ec2",
+                    action="authorize-security-group-ingress",
+                    parameters={"group-name": "ssh-sg", "protocol": "tcp", "port": 22, "cidr": "0.0.0.0/0"},
+                    description="Open SSH",
+                    operation_category=OperationCategory.WRITE,
+                )
+            ]
+        )
+        is_safe, warnings, blocking = self.engine.evaluate_plan(plan)
+        assert is_safe  # SSH to world is warned, not blocked
+        assert any("ssh (port 22)" in w.lower() for w in warnings)
+
+    def test_max_commands_per_plan_exceeded_blocked(self):
+        commands = [
+            CLICommand(
+                command_id=f"cmd-{i}",
+                service="ec2",
+                action="describe-instances",
+                parameters={},
+                description=f"Cmd {i}",
+                operation_category=OperationCategory.READ_ONLY,
+            )
+            for i in range(30)  # Default limit is 25
+        ]
+        plan = ProvisioningPlan(
+            user_request="Too many commands",
+            intent="Run 30 commands",
+            operation_type=OperationType.DESCRIBE,
+            operation_category=OperationCategory.READ_ONLY,
+            aws_region="ap-south-1",
+            commands=commands,
+        )
+        is_safe, warnings, blocking = self.engine.evaluate_plan(plan)
+        assert not is_safe
+        assert any("exceeding the maximum allowed limit" in b.lower() for b in blocking)
+
 class TestSanitizer:
     def setup_method(self):
         self.sanitizer = OutputSanitizer()

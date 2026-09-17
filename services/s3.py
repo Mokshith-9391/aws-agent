@@ -2,7 +2,8 @@
 S3 Service Handler for AWS Provisioning Agent.
 
 Provides service metadata, resource type definitions (bucket),
-IAM permissions, parameter requirements, and cost warnings for Amazon S3.
+IAM permissions, parameter requirements, cost warnings, and deterministic
+command builders for Amazon S3.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.models import CLICommand, OperationCategory
 from services.registry import (
     AWSServiceRegistry,
     ResourceTypeDefinition,
@@ -20,32 +22,93 @@ from services.registry import (
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Service Constants
-# ──────────────────────────────────────────────
-
 SERVICE_NAME = "s3"
 CLI_SERVICE = "s3api"
 SERVICE_DESCRIPTION = "Amazon Simple Storage Service"
 
+
 # ──────────────────────────────────────────────
-# Pydantic Parameter Models
+# Deterministic Command Builders
 # ──────────────────────────────────────────────
 
-class S3BucketParams(BaseModel):
-    """Parameter schema for creating an S3 bucket."""
-    model_config = ConfigDict(populate_by_name=True)
+def build_create_bucket_command(
+    bucket_name: str,
+    region: str = "ap-south-1",
+    acl: Optional[str] = None,
+    command_id: Optional[str] = None,
+    resource_ref: str = "s3.bucket",
+) -> CLICommand:
+    """Deterministically construct a create-bucket command with proper LocationConstraint."""
+    params: dict[str, Any] = {"bucket": bucket_name}
 
-    bucket: str = Field(..., alias="bucket", description="Globally unique name for the S3 bucket")
-    create_bucket_configuration: Optional[dict[str, Any]] = Field(
-        None,
-        alias="create-bucket-configuration",
-        description="Configuration for the bucket, e.g. LocationConstraint",
+    # S3 API rule: us-east-1 does NOT accept LocationConstraint; all other regions REQUIRE it.
+    if region and region != "us-east-1":
+        params["create-bucket-configuration"] = f"LocationConstraint={region}"
+
+    if acl:
+        params["acl"] = acl
+
+    cmd = CLICommand(
+        command_id=command_id or "cmd-s3-create",
+        service="s3api",
+        action="create-bucket",
+        parameters=params,
+        region=region,
+        description=f"Create S3 bucket '{bucket_name}' in {region}",
+        operation_category=OperationCategory.WRITE,
+        resource_ref=resource_ref,
+        output_key="Location",
     )
-    acl: Optional[str] = Field(
-        None,
-        alias="acl",
-        description="Canned ACL to apply to the bucket (e.g., private, public-read)",
+    cmd.rollback_command = build_delete_bucket_command(
+        bucket_name=bucket_name,
+        resource_ref=resource_ref,
+    )
+    return cmd
+
+
+def build_head_bucket_command(
+    bucket_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a head-bucket verification command."""
+    return CLICommand(
+        command_id=command_id or "cmd-s3-head",
+        service="s3api",
+        action="head-bucket",
+        parameters={"bucket": bucket_name},
+        description=f"Verify existence and access to S3 bucket '{bucket_name}'",
+        operation_category=OperationCategory.READ_ONLY,
+        resource_ref=resource_ref,
+    )
+
+
+def build_delete_bucket_command(
+    bucket_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-bucket command."""
+    return CLICommand(
+        command_id=command_id or "cmd-s3-delete",
+        service="s3api",
+        action="delete-bucket",
+        parameters={"bucket": bucket_name},
+        description=f"Delete S3 bucket '{bucket_name}'",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_list_buckets_command(command_id: Optional[str] = None) -> CLICommand:
+    """Deterministically construct a list-buckets command."""
+    return CLICommand(
+        command_id=command_id or "cmd-s3-list",
+        service="s3api",
+        action="list-buckets",
+        parameters={},
+        description="List all S3 buckets in account",
+        operation_category=OperationCategory.READ_ONLY,
     )
 
 
@@ -78,10 +141,6 @@ def create_bucket_resource_def() -> ResourceTypeDefinition:
     )
 
 
-# ──────────────────────────────────────────────
-# Service Definition & Registration
-# ──────────────────────────────────────────────
-
 def get_s3_service_definition() -> ServiceDefinition:
     """Build and return the S3 ServiceDefinition."""
     service_def = ServiceDefinition(
@@ -98,32 +157,14 @@ def get_s3_service_definition() -> ServiceDefinition:
             "delete-objects",
         ],
     )
-
     service_def.add_resource_type(create_bucket_resource_def())
     return service_def
 
 
 def register_s3_service(registry: AWSServiceRegistry) -> None:
-    """
-    Register the S3 service and its resource types with the service registry.
-
-    Args:
-        registry: Target AWSServiceRegistry instance.
-
-    Raises:
-        TypeError: If registry is not an instance of AWSServiceRegistry.
-    """
+    """Register the S3 service with the registry."""
     if not isinstance(registry, AWSServiceRegistry):
         raise TypeError(f"Expected AWSServiceRegistry, got {type(registry).__name__}")
-
-    try:
-        service_def = get_s3_service_definition()
-        registry.register_service(service_def)
-        logger.info(
-            "Registered S3 service with %d resource types: %s",
-            len(service_def.resource_types),
-            list(service_def.resource_types.keys()),
-        )
-    except Exception as exc:
-        logger.error("Failed to register S3 service: %s", exc, exc_info=True)
-        raise
+    service_def = get_s3_service_definition()
+    registry.register_service(service_def)
+    logger.info("Registered S3 service")

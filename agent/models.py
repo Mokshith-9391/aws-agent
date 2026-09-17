@@ -36,7 +36,9 @@ class OperationType(str, Enum):
 
 
 class OperationCategory(str, Enum):
-    """Security classification for operations."""
+    """Security classification for operations.
+    Must always be computed or verified deterministically by application code.
+    """
     READ_ONLY = "READ_ONLY"
     WRITE = "WRITE"
     DESTRUCTIVE = "DESTRUCTIVE"
@@ -50,8 +52,31 @@ class RiskLevel(str, Enum):
     CRITICAL = "CRITICAL"
 
 
+class ApprovalType(str, Enum):
+    """Authoritative approval type required for plan execution."""
+    AUTO = "auto"
+    STANDARD = "standard"
+    EXPLICIT_CONFIRMATION = "explicit_confirmation"
+
+
+class ResourceOwnership(str, Enum):
+    """Scope/ownership tracking for infrastructure resources."""
+    CREATED_BY_THIS_PLAN = "CREATED_BY_THIS_PLAN"
+    REUSED_FROM_EXISTING = "REUSED_FROM_EXISTING"
+    DISCOVERED_ONLY = "DISCOVERED_ONLY"
+
+
+class DiscoveryOutcome(str, Enum):
+    """Outcome of attempting to discover existing AWS resources."""
+    EXISTS_AND_REUSABLE = "EXISTS_AND_REUSABLE"
+    EXISTS_BUT_INCOMPATIBLE = "EXISTS_BUT_INCOMPATIBLE"
+    NOT_FOUND = "NOT_FOUND"
+    AMBIGUOUS = "AMBIGUOUS"
+    DISCOVERY_FAILED = "DISCOVERY_FAILED"
+
+
 class ExecutionStatus(str, Enum):
-    """Status of command execution."""
+    """Coherent state machine for provisioning execution."""
     PENDING = "PENDING"
     APPROVED = "APPROVED"
     EXECUTING = "EXECUTING"
@@ -60,7 +85,19 @@ class ExecutionStatus(str, Enum):
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     DRY_RUN = "DRY_RUN"
+    ROLLBACK_PENDING = "ROLLBACK_PENDING"
+    ROLLING_BACK = "ROLLING_BACK"
     ROLLED_BACK = "ROLLED_BACK"
+    ROLLBACK_FAILED = "ROLLBACK_FAILED"
+    VERIFICATION_FAILED = "VERIFICATION_FAILED"
+
+
+class CommandExecutionStatus(str, Enum):
+    """Execution state of individual commands within a plan."""
+    PENDING = "PENDING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
 
 
 class ApprovalStatus(str, Enum):
@@ -93,14 +130,30 @@ class AWSService(str, Enum):
 # Resource Models
 # ──────────────────────────────────────────────
 
+class LogicalResource(BaseModel):
+    """A logical AWS resource identified and managed by the plan."""
+    resource_ref: str = Field(..., description="Stable logical reference key (e.g. 'vpc.main', 'security_group.web')")
+    resource_type: str = Field(..., description="Resource type (e.g. 'vpc', 'subnet', 'security_group', 'instance')")
+    service: str = Field(..., description="AWS service (e.g. 'ec2', 's3api', 'iam')")
+    resource_id: Optional[str] = Field(None, description="Actual AWS resource ID when created or discovered")
+    resource_name: Optional[str] = Field(None, description="Desired or discovered resource name")
+    ownership: ResourceOwnership = Field(
+        default=ResourceOwnership.CREATED_BY_THIS_PLAN,
+        description="Whether created by this plan, reused from existing, or discovered only"
+    )
+    attributes: dict[str, Any] = Field(default_factory=dict, description="Extracted resource attributes (e.g. CidrBlock, Arn)")
+    dependencies: list[str] = Field(default_factory=list, description="Logical references this resource depends on")
+
+
 class ResourceConfig(BaseModel):
     """Configuration for a single AWS resource."""
     service: str = Field(..., description="AWS service (e.g., ec2, s3, vpc)")
     resource_type: str = Field(..., description="Resource type (e.g., instance, bucket, vpc)")
     resource_name: Optional[str] = Field(None, description="Desired resource name/identifier")
     configuration: dict[str, Any] = Field(default_factory=dict, description="Resource-specific configuration")
-    dependencies: list[str] = Field(default_factory=list, description="Resource IDs this resource depends on")
+    dependencies: list[str] = Field(default_factory=list, description="Resource references this resource depends on")
     tags: dict[str, str] = Field(default_factory=dict, description="Tags to apply to the resource")
+    logical_ref: Optional[str] = Field(None, description="Logical resource identifier (e.g. 'ec2.web')")
 
 
 class CLICommand(BaseModel):
@@ -110,18 +163,40 @@ class CLICommand(BaseModel):
     action: str = Field(..., description="CLI action (e.g., run-instances, create-bucket)")
     parameters: dict[str, Any] = Field(default_factory=dict, description="CLI parameters as key-value pairs")
     region: Optional[str] = Field(None, description="AWS region override for this command")
+    profile: Optional[str] = Field(None, description="AWS profile override for this command")
     description: str = Field("", description="Human-readable description of what this command does")
     operation_category: OperationCategory = Field(OperationCategory.WRITE)
-    resource_ref: Optional[str] = Field(None, description="Reference to the resource this command operates on")
+    resource_ref: Optional[str] = Field(None, description="Logical reference to the resource this command operates on (e.g. 'vpc.main')")
     depends_on: list[str] = Field(default_factory=list, description="Command IDs this command depends on")
     output_key: Optional[str] = Field(None, description="JSON path to extract from output for downstream use")
     rollback_command: Optional[CLICommand] = Field(None, description="Command to undo this operation")
 
-    def to_cli_args(self) -> list[str]:
-        """Convert to a list of CLI arguments for subprocess."""
+    def to_cli_args(
+        self,
+        profile: Optional[str] = None,
+        region: Optional[str] = None,
+    ) -> list[str]:
+        """Convert to a list of CLI arguments for subprocess with explicit profile & region.
+
+        Args:
+            profile: Optional override profile.
+            region: Optional override region.
+
+        Returns:
+            Argument array starting with 'aws'.
+        """
         args = ["aws", self.service, self.action]
-        if self.region:
-            args.extend(["--region", self.region])
+
+        # Explicit profile propagation
+        eff_profile = self.profile or profile
+        if eff_profile and eff_profile.strip():
+            args.extend(["--profile", eff_profile.strip()])
+
+        # Explicit region propagation
+        eff_region = self.region or region
+        if eff_region and eff_region.strip():
+            args.extend(["--region", eff_region.strip()])
+
         for key, value in self.parameters.items():
             arg_key = f"--{key}"
             if isinstance(value, bool):
@@ -135,13 +210,15 @@ class CLICommand(BaseModel):
                 args.extend([arg_key, json.dumps(value)])
             else:
                 args.extend([arg_key, str(value)])
-        args.append("--output")
-        args.append("json")
+
+        args.extend(["--output", "json"])
         return args
 
-    def to_display_string(self) -> str:
+    def to_display_string(
+        self, profile: Optional[str] = None, region: Optional[str] = None
+    ) -> str:
         """Generate a human-readable CLI command string for display."""
-        return " ".join(self.to_cli_args())
+        return " ".join(self.to_cli_args(profile=profile, region=region))
 
 
 # Allow self-referencing for rollback_command
@@ -153,6 +230,7 @@ class RollbackStep(BaseModel):
     order: int = Field(..., description="Execution order for rollback (descending)")
     resource_description: str = Field(..., description="What resource this rolls back")
     command: CLICommand = Field(..., description="The rollback CLI command")
+    resource_ref: Optional[str] = Field(None, description="Logical reference of resource being rolled back")
     depends_on_resource_id: Optional[str] = Field(None, description="Resource ID needed for rollback")
 
 
@@ -175,11 +253,13 @@ class ProvisioningPlan(BaseModel):
     operation_category: OperationCategory = Field(OperationCategory.WRITE)
 
     # --- AWS Context ---
+    aws_profile: str = Field(default="default", description="Effective AWS CLI profile")
     aws_region: str = Field(..., description="Target AWS region")
     aws_account_id: Optional[str] = Field(None, description="Target AWS account ID")
 
     # --- Resources ---
     resources: list[ResourceConfig] = Field(default_factory=list, description="Resources to be provisioned/managed")
+    logical_resources: list[LogicalResource] = Field(default_factory=list, description="Logical resource registry tracking ownership")
     dependencies: list[dict[str, str]] = Field(
         default_factory=list,
         description="Dependency relationships between resources: [{from, to}]"
@@ -191,12 +271,28 @@ class ProvisioningPlan(BaseModel):
     # --- Risk & Safety ---
     risk_level: RiskLevel = Field(RiskLevel.MEDIUM, description="Overall risk assessment")
     destructive_operations: bool = Field(False, description="Whether plan includes destructive operations")
+    approval_type: ApprovalType = Field(ApprovalType.STANDARD, description="Authoritative approval level required")
     missing_parameters: list[str] = Field(default_factory=list, description="Parameters the agent needs from the user")
     assumptions: list[str] = Field(default_factory=list, description="Assumptions made by the agent")
     requires_approval: bool = Field(True, description="Whether user approval is required")
 
     # --- Rollback ---
-    rollback_strategy: list[RollbackStep] = Field(default_factory=list, description="Ordered rollback steps")
+    rollback_strategy: list[RollbackStep] = Field(
+        default_factory=list,
+        alias="rollback_steps",
+        description="Ordered rollback steps"
+    )
+
+    model_config = {"populate_by_name": True}
+
+    @property
+    def rollback_steps(self) -> list[RollbackStep]:
+        """Backward-compatible alias for rollback_strategy."""
+        return self.rollback_strategy
+
+    @rollback_steps.setter
+    def rollback_steps(self, steps: list[RollbackStep]) -> None:
+        self.rollback_strategy = steps
 
     # --- Verification ---
     verification_steps: list[CLICommand] = Field(
@@ -236,24 +332,32 @@ class CommandResult(BaseModel):
     stdout: str = Field("")
     stderr: str = Field("")
     duration_seconds: float = Field(0.0)
+    status: CommandExecutionStatus = Field(CommandExecutionStatus.PENDING)
     success: bool = Field(False)
     parsed_output: dict[str, Any] = Field(default_factory=dict, description="Parsed JSON output from AWS CLI")
     resource_ids: dict[str, str] = Field(
         default_factory=dict,
         description="Extracted resource IDs (e.g., {'VpcId': 'vpc-123'})"
     )
+    extracted_attributes: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extracted attributes (e.g. CidrBlock, Arn, GroupName)"
+    )
     error_type: Optional[str] = Field(None, description="AWS error code if failed")
     error_message: Optional[str] = Field(None, description="Human-readable error message")
 
 
 class VerificationResult(BaseModel):
-    """Result of verifying a resource after provisioning."""
+    """Result of verifying a resource after provisioning using actual AWS state."""
+    resource_ref: Optional[str] = None
     resource_type: str
+    service: str = "ec2"
     resource_id: str
     verified: bool = False
     state: Optional[str] = None
     details: dict[str, Any] = Field(default_factory=dict)
     message: str = ""
+    error: Optional[str] = None
 
 
 class ExecutionResult(BaseModel):
@@ -270,9 +374,10 @@ class ExecutionResult(BaseModel):
     # --- Resource tracking ---
     created_resources: dict[str, str] = Field(
         default_factory=dict,
-        description="Map of resource type to resource ID for all successfully created resources"
+        description="Map of resource type or ref to resource ID for all successfully created resources"
     )
     failed_resources: list[str] = Field(default_factory=list, description="Resources that failed to create")
+    skipped_commands: list[str] = Field(default_factory=list, description="Commands skipped due to failed dependencies")
 
     # --- Metadata ---
     total_commands: int = 0
@@ -286,10 +391,20 @@ class ExecutionResult(BaseModel):
         """Update command counts from results."""
         self.total_commands = len(self.command_results)
         self.successful_commands = sum(1 for r in self.command_results if r.success)
-        self.failed_commands = sum(1 for r in self.command_results if not r.success)
+        self.failed_commands = sum(1 for r in self.command_results if not r.success and r.status != CommandExecutionStatus.SKIPPED)
+
+        if self.dry_run:
+            self.status = ExecutionStatus.DRY_RUN
+            return
+
         if self.failed_commands == 0 and self.successful_commands > 0:
-            self.status = ExecutionStatus.SUCCESS
-        elif self.successful_commands > 0 and self.failed_commands > 0:
+            # Check verification
+            has_failed_verification = any(not vr.verified for vr in self.verification_results)
+            if has_failed_verification:
+                self.status = ExecutionStatus.VERIFICATION_FAILED
+            else:
+                self.status = ExecutionStatus.SUCCESS
+        elif self.successful_commands > 0 and (self.failed_commands > 0 or len(self.skipped_commands) > 0):
             self.status = ExecutionStatus.PARTIAL_SUCCESS
         elif self.failed_commands > 0 and self.successful_commands == 0:
             self.status = ExecutionStatus.FAILED
@@ -305,6 +420,7 @@ class ExecutionHistoryEntry(BaseModel):
     timestamp: datetime
     user_request: str
     aws_account_id: Optional[str] = None
+    aws_profile: str = "default"
     aws_region: str
     intent: str
     operation_type: OperationType
@@ -360,6 +476,7 @@ class AgentResponse(BaseModel):
     plan: Optional[ProvisioningPlan] = None
     execution_result: Optional[ExecutionResult] = None
     requires_approval: bool = False
+    approval_type: ApprovalType = ApprovalType.STANDARD
     requires_input: bool = False
     input_questions: list[str] = Field(default_factory=list)
     explanation: Optional[str] = None

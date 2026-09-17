@@ -48,6 +48,58 @@ class TestAWSCLIExecutor:
         assert result.error_type == "ActionNotAllowed"
 
     @patch("subprocess.run")
+    def test_profile_and_region_propagation(self, mock_run):
+        """Critical Fix #1: Prove selected profile & region propagate to subprocess args and env."""
+        mock_run.return_value = MagicMock(returncode=0, stdout="{}", stderr="")
+
+        cmd = CLICommand(
+            service="ec2",
+            action="describe-vpcs",
+            parameters={},
+            description="Test profile propagation",
+            operation_category=OperationCategory.READ_ONLY,
+        )
+
+        result = self.executor.execute_command(
+            cmd=cmd,
+            region="us-west-2",
+            profile="my-dev-profile",
+            dry_run=False,
+        )
+        assert result.success is True
+
+        args_called = mock_run.call_args[0][0]
+        # Verify --profile was explicitly included in arguments array
+        assert "--profile" in args_called
+        profile_idx = args_called.index("--profile")
+        assert args_called[profile_idx + 1] == "my-dev-profile"
+
+        # Verify --region was explicitly included in arguments array
+        assert "--region" in args_called
+        region_idx = args_called.index("--region")
+        assert args_called[region_idx + 1] == "us-west-2"
+
+        # Verify environment variables match
+        env_called = mock_run.call_args.kwargs.get("env", {})
+        assert env_called.get("AWS_PROFILE") == "my-dev-profile"
+        assert env_called.get("AWS_DEFAULT_REGION") == "us-west-2"
+
+    def test_unresolved_placeholder_rejected(self):
+        """Critical Fix #5: An unresolved placeholder must block execution."""
+        cmd = CLICommand(
+            service="ec2",
+            action="create-subnet",
+            parameters={"vpc-id": "{{vpc.main.id}}", "cidr-block": "10.0.1.0/24"},
+            description="Subnet with unresolved placeholder",
+            operation_category=OperationCategory.WRITE,
+        )
+
+        result = self.executor.execute_command(cmd, region="ap-south-1", dry_run=False)
+        assert result.success is False
+        assert result.error_type == "UnresolvedPlaceholder"
+        assert "unresolved" in result.stderr.lower()
+
+    @patch("subprocess.run")
     def test_successful_command_execution(self, mock_run):
         mock_output = json.dumps({"Vpc": {"VpcId": "vpc-0123456789abcdef0"}})
         mock_run.return_value = MagicMock(

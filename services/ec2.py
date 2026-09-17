@@ -2,7 +2,8 @@
 EC2 Service Handler for AWS Provisioning Agent.
 
 Provides service metadata, resource type definitions (instance, key_pair, ami),
-IAM permissions, parameter requirements, and cost warnings for Amazon EC2.
+IAM permissions, parameter requirements, cost warnings, and deterministic
+command builders for Amazon EC2.
 """
 
 from __future__ import annotations
@@ -12,6 +13,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.models import CLICommand, OperationCategory
 from services.registry import (
     AWSServiceRegistry,
     ResourceTypeDefinition,
@@ -20,46 +22,124 @@ from services.registry import (
 
 logger = logging.getLogger(__name__)
 
-# ──────────────────────────────────────────────
-# Service Constants
-# ──────────────────────────────────────────────
-
 SERVICE_NAME = "ec2"
 CLI_SERVICE = "ec2"
 SERVICE_DESCRIPTION = "Amazon Elastic Compute Cloud"
 
+
 # ──────────────────────────────────────────────
-# Pydantic Parameter Models
+# Deterministic Command Builders
 # ──────────────────────────────────────────────
 
-class EC2InstanceParams(BaseModel):
-    """Parameter schema for creating an EC2 instance."""
-    model_config = ConfigDict(populate_by_name=True)
+def build_run_instances_command(
+    image_id: str,
+    instance_type: str = "t3.micro",
+    count: int = 1,
+    subnet_id: Optional[str] = None,
+    security_group_ids: Optional[list[str]] = None,
+    key_name: Optional[str] = None,
+    name_tag: Optional[str] = None,
+    user_data: Optional[str] = None,
+    command_id: Optional[str] = None,
+    depends_on: Optional[list[str]] = None,
+    resource_ref: str = "ec2.instance",
+) -> CLICommand:
+    """Deterministically construct a run-instances command with proper flags."""
+    params: dict[str, Any] = {
+        "image-id": image_id,
+        "instance-type": instance_type,
+        "count": str(count),
+    }
+    if subnet_id:
+        params["subnet-id"] = subnet_id
+    if security_group_ids:
+        params["security-group-ids"] = security_group_ids
+    if key_name:
+        params["key-name"] = key_name
+    if user_data:
+        params["user-data"] = user_data
+    if name_tag:
+        params["tag-specifications"] = [
+            {
+                "ResourceType": "instance",
+                "Tags": [{"Key": "Name", "Value": name_tag}],
+            }
+        ]
 
-    image_id: str = Field(..., alias="image-id", description="ID of the AMI to launch")
-    instance_type: str = Field(..., alias="instance-type", description="EC2 instance type (e.g., t3.micro)")
-    key_name: Optional[str] = Field(None, alias="key-name", description="Key pair name for SSH access")
-    security_group_ids: Optional[list[str]] = Field(None, alias="security-group-ids", description="List of security group IDs")
-    subnet_id: Optional[str] = Field(None, alias="subnet-id", description="Subnet ID to launch into")
-    count: Optional[int] = Field(1, alias="count", description="Number of instances to launch")
-    tag_specifications: Optional[list[dict[str, Any]]] = Field(None, alias="tag-specifications", description="Resource tags specification")
-    user_data: Optional[str] = Field(None, alias="user-data", description="Base64-encoded or raw user data script")
+    cmd = CLICommand(
+        command_id=command_id or "cmd-ec2-run",
+        service="ec2",
+        action="run-instances",
+        parameters=params,
+        description=f"Launch {instance_type} EC2 instance using {image_id}",
+        operation_category=OperationCategory.WRITE,
+        resource_ref=resource_ref,
+        depends_on=depends_on or [],
+        output_key="Instances[0].InstanceId",
+    )
+    # Attach rollback command
+    cmd.rollback_command = build_terminate_instances_command(
+        instance_ids=[f"{{{{{resource_ref}.id}}}}"],
+        resource_ref=resource_ref,
+    )
+    return cmd
 
 
-class EC2KeyPairParams(BaseModel):
-    """Parameter schema for creating an EC2 key pair."""
-    model_config = ConfigDict(populate_by_name=True)
+def build_describe_instances_command(
+    instance_ids: Optional[list[str]] = None,
+    filters: Optional[list[dict[str, Any]]] = None,
+    command_id: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a describe-instances command."""
+    params: dict[str, Any] = {}
+    if instance_ids:
+        params["instance-ids"] = instance_ids
+    if filters:
+        params["filters"] = filters
 
-    key_name: str = Field(..., alias="key-name", description="Unique name for the key pair")
+    return CLICommand(
+        command_id=command_id or "cmd-ec2-describe",
+        service="ec2",
+        action="describe-instances",
+        parameters=params,
+        description="Describe EC2 instances and check their runtime state",
+        operation_category=OperationCategory.READ_ONLY,
+    )
 
 
-class EC2AMIQueryParams(BaseModel):
-    """Parameter schema for querying AMIs."""
-    model_config = ConfigDict(populate_by_name=True)
+def build_terminate_instances_command(
+    instance_ids: list[str],
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a terminate-instances command."""
+    return CLICommand(
+        command_id=command_id or "cmd-ec2-terminate",
+        service="ec2",
+        action="terminate-instances",
+        parameters={"instance-ids": instance_ids},
+        description=f"Terminate EC2 instance(s): {', '.join(instance_ids)}",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
 
-    owners: list[str] = Field(..., alias="owners", description="List of AMI owners (e.g., ['self'], ['amazon'])")
-    image_ids: Optional[list[str]] = Field(None, alias="image-ids", description="Optional list of image IDs")
-    filters: Optional[list[dict[str, Any]]] = Field(None, alias="filters", description="Optional search filters")
+
+def build_create_key_pair_command(
+    key_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: str = "ec2.key_pair",
+) -> CLICommand:
+    """Deterministically construct a create-key-pair command."""
+    return CLICommand(
+        command_id=command_id or "cmd-ec2-keypair",
+        service="ec2",
+        action="create-key-pair",
+        parameters={"key-name": key_name},
+        description=f"Create SSH key pair '{key_name}'",
+        operation_category=OperationCategory.WRITE,
+        resource_ref=resource_ref,
+        output_key="KeyPairId",
+    )
 
 
 # ──────────────────────────────────────────────
@@ -145,10 +225,6 @@ def create_ami_resource_def() -> ResourceTypeDefinition:
     )
 
 
-# ──────────────────────────────────────────────
-# Service Definition & Registration
-# ──────────────────────────────────────────────
-
 def get_ec2_service_definition() -> ServiceDefinition:
     """Build and return the EC2 ServiceDefinition."""
     service_def = ServiceDefinition(
@@ -167,35 +243,16 @@ def get_ec2_service_definition() -> ServiceDefinition:
             "describe-images",
         ],
     )
-
     service_def.add_resource_type(create_instance_resource_def())
     service_def.add_resource_type(create_key_pair_resource_def())
     service_def.add_resource_type(create_ami_resource_def())
-
     return service_def
 
 
 def register_ec2_service(registry: AWSServiceRegistry) -> None:
-    """
-    Register the EC2 service and its resource types with the service registry.
-
-    Args:
-        registry: Target AWSServiceRegistry instance.
-
-    Raises:
-        TypeError: If registry is not an instance of AWSServiceRegistry.
-    """
+    """Register the EC2 service with the registry."""
     if not isinstance(registry, AWSServiceRegistry):
         raise TypeError(f"Expected AWSServiceRegistry, got {type(registry).__name__}")
-
-    try:
-        service_def = get_ec2_service_definition()
-        registry.register_service(service_def)
-        logger.info(
-            "Registered EC2 service with %d resource types: %s",
-            len(service_def.resource_types),
-            list(service_def.resource_types.keys()),
-        )
-    except Exception as exc:
-        logger.error("Failed to register EC2 service: %s", exc, exc_info=True)
-        raise
+    service_def = get_ec2_service_definition()
+    registry.register_service(service_def)
+    logger.info("Registered EC2 service")

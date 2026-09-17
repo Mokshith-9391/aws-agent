@@ -81,6 +81,9 @@ class Settings(BaseSettings):
         r"(?i)token\s*[=:]\s*\S+",      # Tokens
     ]
 
+    # --- Testing & Integration ---
+    AWS_INTEGRATION_TESTS: bool = False
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
@@ -92,13 +95,19 @@ class Settings(BaseSettings):
         """Get the resource naming prefix."""
         return self.RESOURCE_NAME_PREFIX
 
-    def get_aws_env(self) -> dict[str, str]:
-        """Get environment variables for AWS CLI subprocess calls."""
+    def get_aws_env(
+        self, profile: Optional[str] = None, region: Optional[str] = None
+    ) -> dict[str, str]:
+        """Get environment variables for AWS CLI subprocess calls with explicit profile and region overrides."""
         env = os.environ.copy()
-        if self.AWS_PROFILE:
-            env["AWS_PROFILE"] = self.AWS_PROFILE
-        if self.AWS_REGION:
-            env["AWS_DEFAULT_REGION"] = self.AWS_REGION
+        effective_profile = profile or self.AWS_PROFILE
+        effective_region = region or self.AWS_REGION
+
+        if effective_profile and effective_profile.strip():
+            env["AWS_PROFILE"] = effective_profile.strip()
+        if effective_region and effective_region.strip():
+            env["AWS_DEFAULT_REGION"] = effective_region.strip()
+            env["AWS_REGION"] = effective_region.strip()
         return env
 
 

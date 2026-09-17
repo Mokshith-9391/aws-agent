@@ -2,9 +2,10 @@
 Agent Orchestrator.
 
 The central coordinator that manages the complete lifecycle of a user request:
-parse → plan → validate → approve → execute → verify → explain.
+parse → discover → plan → graph sort → validate → policy → approve → execute → verify → explain.
 
-This is the main entry point for the agent logic, called by the Streamlit UI.
+Ensures deterministic execution, profile & region propagation, recursive placeholder
+resolution, true DAG execution, and controlled rollback.
 """
 
 from __future__ import annotations
@@ -15,24 +16,33 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from agent.dependency_graph import DependencyGraph, CyclicDependencyError, MissingDependencyError
 from agent.explainer import Explainer
 from agent.llm_client import LLMClient, create_llm_client
 from agent.models import (
     AgentResponse,
     ApprovalStatus,
+    ApprovalType,
     CLICommand,
+    CommandExecutionStatus,
     CommandResult,
     ConversationMessage,
+    DiscoveryOutcome,
     ExecutionHistoryEntry,
     ExecutionResult,
     ExecutionStatus,
+    LogicalResource,
     OperationCategory,
     OperationType,
     ProvisioningPlan,
+    ResourceOwnership,
+    RiskLevel,
     VerificationResult,
 )
 from agent.parser import RequestParser
 from agent.planner import Planner
+from agent.resource_context import ResourceContext, UnresolvedReferenceError
+from agent.rollback import RollbackEngine
 from aws.cli_executor import AWSCLIExecutor
 from aws.cli_validator import CLICommandValidator
 from aws.identity import AWSIdentityManager
@@ -49,24 +59,14 @@ logger = logging.getLogger(__name__)
 
 
 class AgentOrchestrator:
-    """
-    Orchestrates the complete agent workflow.
-
-    Manages the pipeline from user request to final explanation,
-    coordinating between all subsystems.
-    """
+    """Orchestrates the complete agent workflow with deterministic safety controls."""
 
     def __init__(self, settings: Optional[Settings] = None) -> None:
-        """Initialize the orchestrator with all subsystems.
-
-        Args:
-            settings: Application settings. Uses global if not provided.
-        """
         self._settings = settings or get_settings()
         self._initialized = False
         self._init_error: Optional[str] = None
 
-        # Subsystem references (initialized lazily or on init)
+        # Subsystems
         self._llm_client: Optional[LLMClient] = None
         self._parser = RequestParser()
         self._planner: Optional[Planner] = None
@@ -80,28 +80,22 @@ class AgentOrchestrator:
         self._approval_manager = ApprovalManager()
         self._sanitizer = OutputSanitizer()
         self._history_store = ExecutionStore()
+        self._rollback_engine = RollbackEngine(self._executor)
         self._registry: Optional[AWSServiceRegistry] = None
 
         # Session state
         self._conversation_history: list[dict] = []
-        self._session_resources: dict[str, str] = {}
+        self._resource_context = ResourceContext()
 
     def initialize(self) -> tuple[bool, str]:
-        """Initialize the orchestrator and all subsystems.
-
-        Returns:
-            Tuple of (success, message).
-        """
+        """Initialize the orchestrator and all subsystems."""
         try:
-            # Initialize service registry
             self._registry = create_default_registry()
-
-            # Initialize LLM client
             self._llm_client = create_llm_client(self._settings)
+
             if not self._llm_client.is_available():
                 return False, "LLM provider is not available. Check your API key configuration."
 
-            # Initialize planner and explainer
             self._planner = Planner(self._llm_client, self._registry)
             self._explainer = Explainer(self._llm_client)
 
@@ -111,7 +105,7 @@ class AgentOrchestrator:
 
         except Exception as e:
             self._init_error = str(e)
-            logger.error(f"Orchestrator initialization failed: {e}", exc_info=True)
+            logger.error("Orchestrator initialization failed: %s", e, exc_info=True)
             return False, f"Initialization failed: {e}"
 
     @property
@@ -129,18 +123,16 @@ class AgentOrchestrator:
     ) -> AgentResponse:
         """Process a user request through the complete agent pipeline.
 
-        This is the main entry point called by the Streamlit UI.
-
         Args:
             user_request: Natural-language user request.
             region: Target AWS region.
-            profile: AWS profile name.
-            dry_run: Whether to run in dry-run mode.
+            profile: Target AWS CLI profile.
+            dry_run: Whether to run in dry-run mode (default True).
             learning_mode: Whether to include educational content.
             aws_account_id: AWS account ID for context.
 
         Returns:
-            AgentResponse with the plan, results, and explanations.
+            AgentResponse with plan, approval state, and explanations.
         """
         if not self._initialized:
             return AgentResponse(
@@ -148,9 +140,9 @@ class AgentOrchestrator:
                 warnings=["Agent not initialized"],
             )
 
-        logger.info(f"Processing request: {user_request[:100]}... (dry_run={dry_run})")
+        logger.info("Processing request: '%s' (profile=%s, region=%s, dry_run=%s)", user_request[:80], profile, region, dry_run)
 
-        # ── Step 1: Validate Input ──────────────────────────────
+        # ── Step 1: Input Validation & Prompt Injection Defense ──────
         is_valid, issues = self._parser.validate_input(user_request)
         if not is_valid:
             return AgentResponse(
@@ -158,201 +150,243 @@ class AgentOrchestrator:
                 warnings=issues,
             )
 
-        # Sanitize input
-        sanitized_request = self._parser.sanitize_for_llm(user_request)
+        sanitized_input = self._parser.sanitize_for_llm(user_request)
+        hints = self._parser.extract_hints(sanitized_input)
 
-        # Extract quick hints for context
-        hints = self._parser.extract_hints(sanitized_request)
-        if hints.get("detected_region"):
-            region = hints["detected_region"]
+        # Allow region override from prompt if detected
+        effective_region = hints.get("detected_region") or region
+        effective_profile = profile
 
-        # ── Step 2: Discover Existing Resources (if needed) ─────
-        existing_resources_text = "None discovered"
-        if hints.get("mentions_existing_resource") or hints.get("detected_operation") == "create":
-            existing_resources_text = self._discover_existing_resources(region)
+        # ── Step 2: Pre-flight Resource Discovery ────────────────────
+        discovered_text = self._discover_existing_resources(region=effective_region, profile=effective_profile)
 
-        # Add conversation context
-        self._conversation_history.append({
-            "role": "user",
-            "content": sanitized_request,
-        })
-
-        # ── Step 3: Generate Plan ───────────────────────────────
+        # ── Step 3: Plan Generation (Reasoning Layer) ─────────────────
         plan = self._planner.generate_plan(
-            user_request=sanitized_request,
-            region=region,
+            user_request=sanitized_input,
+            region=effective_region,
             account_id=aws_account_id,
-            profile=profile,
+            profile=effective_profile,
             conversation_history=self._conversation_history,
-            session_resources=self._session_resources,
-            existing_resources=existing_resources_text,
+            session_resources={r.resource_ref: r.resource_id for r in self._resource_context.list_resources() if r.resource_id},
+            existing_resources=discovered_text,
         )
 
-        # ── Step 4: Check for Missing Parameters ────────────────
-        if plan.missing_parameters:
-            # Check for actual errors vs missing info
-            errors = [p for p in plan.missing_parameters if p.startswith("Planning error:")]
-            missing = [p for p in plan.missing_parameters if not p.startswith("Planning error:")]
-
-            if errors:
-                return AgentResponse(
-                    message="❌ " + "\n".join(errors),
-                    warnings=errors,
-                )
-
-            if missing and not plan.commands:
-                msg = self._planner.generate_missing_info_message(sanitized_request, missing)
-                return AgentResponse(
-                    message=msg,
-                    requires_input=True,
-                    input_questions=missing,
-                    plan=plan,
-                )
-
-        # ── Step 5: Validate Commands ───────────────────────────
-        validation_issues = self._validate_all_commands(plan)
-        if validation_issues:
-            plan_warnings = [f"⚠️ Validation: {issue}" for issue in validation_issues]
-            # Non-blocking warnings for minor issues
-            critical = [i for i in validation_issues if "injection" in i.lower() or "not allowed" in i.lower()]
-            if critical:
-                return AgentResponse(
-                    message="❌ Command validation failed:\n" + "\n".join(critical),
-                    plan=plan,
-                    warnings=critical,
-                )
-
-        # ── Step 6: Safety Policy Check ─────────────────────────
-        is_safe, policy_warnings, blocking_issues = self._policy_engine.evaluate_plan(plan)
-        if blocking_issues:
+        # Check for planning failure
+        if not plan.is_complete and plan.missing_parameters:
             return AgentResponse(
-                message="🛑 Safety policy violation:\n" + "\n".join(blocking_issues),
+                message=f"I need more information to fulfill your request:\n" + "\n".join(f"- {p}" for p in plan.missing_parameters),
                 plan=plan,
-                warnings=policy_warnings + blocking_issues,
+                requires_input=True,
+                input_questions=plan.missing_parameters,
+                warnings=plan.assumptions,
             )
 
-        # Update risk level from policy engine
-        assessed_risk = self._policy_engine.assess_risk(plan)
-        plan.risk_level = assessed_risk
+        # ── Step 4: Topological Dependency Graph Ordering ────────────
+        try:
+            dep_graph = DependencyGraph(plan.commands)
+            plan.commands = dep_graph.topological_sort()
+        except CyclicDependencyError as cde:
+            return AgentResponse(
+                message=f"❌ Circular dependency detected in plan: {cde}",
+                plan=plan,
+                warnings=[str(cde)],
+            )
+        except MissingDependencyError as mde:
+            return AgentResponse(
+                message=f"❌ Missing dependency in plan: {mde}",
+                plan=plan,
+                warnings=[str(mde)],
+            )
 
-        # ── Step 7: Determine Approval Requirements ─────────────
+        # ── Step 5: Deterministic Command Validation & Category Check ─
+        validation_issues = self._validate_all_commands(plan)
+        if validation_issues:
+            return AgentResponse(
+                message="❌ Command validation failed:\n" + "\n".join(f"- {issue}" for issue in validation_issues),
+                plan=plan,
+                warnings=validation_issues,
+            )
+
+        # ── Step 6: Security & Safety Policy Evaluation ──────────────
+        is_safe, policy_warnings, blocking_issues = self._policy_engine.evaluate_plan(plan)
+        if not is_safe:
+            return AgentResponse(
+                message="🚫 **Operation Blocked by Safety Policy:**\n" + "\n".join(f"- 🛑 {issue}" for issue in blocking_issues),
+                plan=plan,
+                warnings=blocking_issues + policy_warnings,
+            )
+
+        # ── Step 7: Deterministic Risk & Approval Evaluation ──────────
+        plan.risk_level = self._policy_engine.assess_risk(plan)
         approval_info = self._approval_manager.determine_approval_requirement(plan)
+        plan.approval_type = approval_info["approval_type"]
+        plan.requires_approval = approval_info["requires_approval"]
 
-        # ── Step 8: Generate Educational Content (if needed) ────
+        # ── Step 8: Educational Content (if requested) ────────────────
         educational_content = None
         if learning_mode and self._explainer:
             educational_content = self._explainer.generate_educational_content(plan)
 
-        # ── Step 9: Handle Dry Run ──────────────────────────────
+        # ── Step 9: Dry Run Mode (Default) ────────────────────────────
         if dry_run:
-            dry_result = ExecutionResult(
+            dry_results = []
+            for cmd in plan.commands:
+                cmd_res = self._executor.execute_command(
+                    cmd=cmd,
+                    region=effective_region,
+                    profile=effective_profile,
+                    dry_run=True,
+                )
+                dry_results.append(cmd_res)
+
+            dry_execution = ExecutionResult(
                 plan_id=plan.plan_id,
                 status=ExecutionStatus.DRY_RUN,
                 dry_run=True,
+                command_results=dry_results,
             )
+            dry_execution.update_counts()
 
-            explanation = self._generate_dry_run_explanation(plan)
+            explanation = self._generate_dry_run_explanation(plan, effective_profile, effective_region)
 
-            response = AgentResponse(
+            return AgentResponse(
                 message=explanation,
                 plan=plan,
-                execution_result=dry_result,
+                execution_result=dry_execution,
                 requires_approval=False,
-                educational_content=educational_content,
-                warnings=policy_warnings,
-            )
-
-            self._conversation_history.append({
-                "role": "assistant",
-                "content": f"[DRY RUN] Plan: {plan.intent}",
-            })
-
-            return response
-
-        # ── Step 10: Request Approval ───────────────────────────
-        if approval_info["requires_approval"]:
-            response = AgentResponse(
-                message=self._format_approval_message(plan, approval_info),
-                plan=plan,
-                requires_approval=True,
+                approval_type=plan.approval_type,
                 educational_content=educational_content,
                 warnings=policy_warnings + plan.cost_warnings,
             )
-            return response
 
-        # ── Step 11: Auto-approved (READ_ONLY) - Execute ───────
-        return self.execute_approved_plan(plan, region, learning_mode)
+        # ── Step 10: Human Approval Required ─────────────────────────
+        if plan.requires_approval:
+            approval_msg = self._approval_manager.format_approval_request(plan)
+            return AgentResponse(
+                message=approval_msg,
+                plan=plan,
+                requires_approval=True,
+                approval_type=plan.approval_type,
+                educational_content=educational_content,
+                warnings=policy_warnings + plan.cost_warnings,
+            )
+
+        # ── Step 11: Auto-Approved (READ_ONLY) -> Execute ─────────────
+        return self.execute_approved_plan(
+            plan=plan,
+            region=effective_region,
+            profile=effective_profile,
+            learning_mode=learning_mode,
+        )
 
     def execute_approved_plan(
         self,
         plan: ProvisioningPlan,
         region: str,
+        profile: str = "default",
         learning_mode: bool = False,
     ) -> AgentResponse:
-        """Execute an approved provisioning plan.
+        """Execute an approved provisioning plan using the effective profile and region.
 
-        Called after user approval or for auto-approved operations.
-
-        Args:
-            plan: The approved plan to execute.
-            region: Target AWS region.
-            learning_mode: Whether to include educational content.
-
-        Returns:
-            AgentResponse with execution results.
+        Executes commands in topological dependency order, resolves placeholders
+        recursively via ResourceContext, captures live results, halts dependent
+        operations on failure, verifies actual AWS state, and generates technical explanations.
         """
-        logger.info(f"Executing plan: {plan.plan_id}")
+        logger.info("Executing approved plan: %s (profile=%s, region=%s)", plan.plan_id, profile, region)
         start_time = time.time()
 
-        # ── Execute Commands ────────────────────────────────────
         execution_result = ExecutionResult(
             plan_id=plan.plan_id,
             status=ExecutionStatus.EXECUTING,
         )
 
-        command_results = []
+        # Build Dependency Graph to enable smart skipping on failure
+        dep_graph = DependencyGraph(plan.commands)
+        topological_commands = dep_graph.topological_sort()
+
+        command_results: list[CommandResult] = []
         created_resources: dict[str, str] = {}
         failed_resources: list[str] = []
-        resource_id_map: dict[str, str] = {}  # Maps output_key refs to actual IDs
+        skipped_command_ids: set[str] = set()
 
-        for cmd in plan.commands:
-            # Substitute resource IDs from previous commands
-            resolved_cmd = self._resolve_command_references(cmd, resource_id_map)
+        for cmd in topological_commands:
+            # Check if this command must be skipped because an upstream dependency failed
+            if cmd.command_id in skipped_command_ids:
+                logger.warning("Skipping command '%s' due to failed upstream dependency", cmd.command_id)
+                skipped_res = CommandResult(
+                    command_id=cmd.command_id,
+                    command_display=cmd.to_display_string(profile=profile, region=region),
+                    exit_code=-1,
+                    status=CommandExecutionStatus.SKIPPED,
+                    success=False,
+                    error_message="Skipped: required upstream dependency failed.",
+                )
+                command_results.append(skipped_res)
+                execution_result.skipped_commands.append(f"{cmd.service}/{cmd.action} (dependency failed)")
+                continue
 
-            # Execute
+            # ── Resolve Placeholders Recursively (Critical Fix #5) ───
+            try:
+                resolved_params = self._resource_context.resolve_placeholders_recursively(cmd.parameters)
+                resolved_cmd = cmd.model_copy()
+                resolved_cmd.parameters = resolved_params
+
+                # Check for unresolved placeholders before reaching AWS
+                unresolved = self._resource_context.find_unresolved_placeholders(resolved_params)
+                if unresolved:
+                    raise UnresolvedReferenceError(unresolved, cmd.description or cmd.action)
+
+            except UnresolvedReferenceError as ure:
+                logger.error("Unresolved reference in command %s: %s", cmd.command_id, ure)
+                err_res = CommandResult(
+                    command_id=cmd.command_id,
+                    command_display=cmd.to_display_string(profile=profile, region=region),
+                    exit_code=1,
+                    status=CommandExecutionStatus.FAILED,
+                    success=False,
+                    error_type="UnresolvedReference",
+                    error_message=str(ure),
+                )
+                command_results.append(err_res)
+                failed_resources.append(f"{cmd.service}/{cmd.action}: {ure}")
+                # Mark downstream dependents as skipped
+                downstream = dep_graph.get_transitive_dependents(cmd.command_id)
+                skipped_command_ids.update(downstream)
+                continue
+
+            # ── Execute Command with Explicit Profile & Region ────────
             result = self._executor.execute_command(
                 cmd=resolved_cmd,
                 region=region,
+                profile=profile,
                 dry_run=False,
             )
-
-            # Sanitize output
             result = self._sanitizer.sanitize_command_output(result)
             command_results.append(result)
 
             if result.success:
-                # Track created resource IDs
+                # Register created resource in ResourceContext with CREATED_BY_THIS_PLAN ownership
+                ref = cmd.resource_ref or f"{cmd.service}.{cmd.action.split('-')[-1]}"
+                res_id = None
                 if result.resource_ids:
-                    created_resources.update(result.resource_ids)
-                    resource_id_map.update(result.resource_ids)
+                    # Pick primary ID
+                    res_id = next(iter(result.resource_ids.values()))
+                    created_resources[ref] = res_id
 
-                # Also track in session
-                self._session_resources.update(result.resource_ids)
-            else:
-                failed_resources.append(
-                    f"{cmd.service}/{cmd.action}: {result.error_message or 'Unknown error'}"
+                self._resource_context.register_resource(
+                    resource_ref=ref,
+                    resource_type=cmd.service,
+                    service=cmd.service,
+                    resource_id=res_id,
+                    ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
+                    attributes=result.resource_ids,
                 )
-                # Stop execution on failure for dependent commands
-                if self._has_dependents(cmd, plan.commands):
-                    logger.warning(f"Command {cmd.command_id} failed, skipping dependents")
-                    # Add remaining commands as failed
-                    remaining = plan.commands[plan.commands.index(cmd) + 1:]
-                    for rem_cmd in remaining:
-                        if cmd.command_id in rem_cmd.depends_on:
-                            failed_resources.append(
-                                f"{rem_cmd.service}/{rem_cmd.action}: Skipped (dependency failed)"
-                            )
-                    break
+            else:
+                failed_msg = f"{cmd.service}/{cmd.action}: {result.error_message or 'Command returned non-zero exit code'}"
+                failed_resources.append(failed_msg)
+                # Smart skipping: mark all downstream dependents to skip
+                downstream = dep_graph.get_transitive_dependents(cmd.command_id)
+                skipped_command_ids.update(downstream)
 
         execution_result.command_results = command_results
         execution_result.created_resources = created_resources
@@ -360,12 +394,13 @@ class AgentOrchestrator:
         execution_result.duration_seconds = time.time() - start_time
         execution_result.update_counts()
 
-        # ── Verify Resources ────────────────────────────────────
+        # ── Step 12: Live Resource Verification (Critical Fix #15/16) ─
         if execution_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.PARTIAL_SUCCESS):
-            verification_results = self._verify_resources(plan, created_resources, region)
+            verification_results = self._verify_created_resources(region=region, profile=profile)
             execution_result.verification_results = verification_results
+            execution_result.update_counts()
 
-        # ── Generate Explanation ────────────────────────────────
+        # ── Step 13: Post-Execution Technical Explanation ─────────────
         explanation = ""
         educational_content = None
         if self._explainer:
@@ -377,296 +412,109 @@ class AgentOrchestrator:
             if learning_mode:
                 educational_content = self._explainer.generate_educational_content(plan)
 
-        # ── Save to History ─────────────────────────────────────
-        self._save_to_history(plan, execution_result, explanation)
+        # ── Step 14: Save Sanitized Record to History Store ───────────
+        self._save_to_history(plan, execution_result, explanation, profile=profile, region=region)
 
-        # ── Update Conversation ─────────────────────────────────
-        status_text = execution_result.status.value
-        self._conversation_history.append({
-            "role": "assistant",
-            "content": f"[{status_text}] {plan.intent}. Resources: {json.dumps(created_resources)}",
-        })
-
-        # ── Build Response ──────────────────────────────────────
+        # ── Step 15: Build Consolidated Response ──────────────────────
         warnings = plan.cost_warnings.copy()
         if execution_result.status == ExecutionStatus.PARTIAL_SUCCESS:
-            warnings.append("Some operations failed. Review the results for details.")
-        if execution_result.status == ExecutionStatus.FAILED:
-            warnings.append("All operations failed. Check AWS credentials and permissions.")
+            warnings.append("⚠️ Some operations failed. Dependent operations were safely skipped.")
+        elif execution_result.status == ExecutionStatus.FAILED:
+            warnings.append("❌ All operations failed. Check credentials, permissions, and parameters.")
+        elif execution_result.status == ExecutionStatus.VERIFICATION_FAILED:
+            warnings.append("⚠️ Commands executed, but AWS state verification failed for one or more resources.")
 
         return AgentResponse(
-            message=explanation or f"Execution completed: {status_text}",
+            message=explanation or f"Execution finished with status: {execution_result.status.value}",
             plan=plan,
             execution_result=execution_result,
+            approval_type=plan.approval_type,
             explanation=explanation,
             educational_content=educational_content,
             warnings=warnings,
             resource_summary=created_resources,
         )
 
-    def _validate_all_commands(self, plan: ProvisioningPlan) -> list[str]:
-        """Validate all commands in the plan.
-
-        Args:
-            plan: The plan to validate.
-
-        Returns:
-            List of validation issues.
-        """
-        all_issues = []
-        for cmd in plan.commands:
-            is_valid, issues = self._validator.validate_command(cmd)
-            if not is_valid:
-                all_issues.extend(issues)
-        return all_issues
-
-    def _resolve_command_references(
-        self, cmd: CLICommand, resource_id_map: dict[str, str]
-    ) -> CLICommand:
-        """Resolve placeholder references in command parameters.
-
-        Replaces {{Key}} style references with actual resource IDs
-        from previously executed commands.
-
-        Args:
-            cmd: The command to resolve.
-            resource_id_map: Map of resource keys to actual IDs.
-
-        Returns:
-            Command with resolved parameters.
-        """
-        import re
-        resolved_params = {}
-        for key, value in cmd.parameters.items():
-            if isinstance(value, str):
-                # Replace {{ResourceKey}} patterns
-                def replacer(match):
-                    ref_key = match.group(1)
-                    return resource_id_map.get(ref_key, match.group(0))
-
-                resolved_value = re.sub(r"\{\{(\w+(?:\.\w+)*)\}\}", replacer, value)
-                resolved_params[key] = resolved_value
-            else:
-                resolved_params[key] = value
-
-        resolved_cmd = cmd.model_copy()
-        resolved_cmd.parameters = resolved_params
-        return resolved_cmd
-
-    def _has_dependents(self, cmd: CLICommand, all_commands: list[CLICommand]) -> bool:
-        """Check if any other commands depend on this one."""
-        return any(
-            cmd.command_id in other.depends_on
-            for other in all_commands
-            if other.command_id != cmd.command_id
-        )
-
-    def _verify_resources(
-        self,
-        plan: ProvisioningPlan,
-        created_resources: dict[str, str],
-        region: str,
-    ) -> list[VerificationResult]:
-        """Verify created resources.
-
-        Args:
-            plan: The executed plan.
-            created_resources: Map of created resource types to IDs.
-            region: AWS region.
-
-        Returns:
-            List of verification results.
-        """
-        results = []
-        for resource_type, resource_id in created_resources.items():
-            # Determine the service from the resource type
-            service = self._infer_service_from_resource_type(resource_type)
-            try:
-                vr = self._verifier.verify_resource(
-                    service=service,
-                    resource_type=resource_type,
-                    resource_id=resource_id,
-                    region=region,
-                )
-                results.append(vr)
-            except Exception as e:
-                logger.error(f"Verification failed for {resource_type}/{resource_id}: {e}")
-                results.append(VerificationResult(
-                    resource_type=resource_type,
-                    resource_id=resource_id,
-                    verified=False,
-                    message=f"Verification error: {e}",
-                ))
+    def _verify_created_resources(self, region: str, profile: str) -> list[VerificationResult]:
+        """Verify only resources created by the current plan using logical references."""
+        results: list[VerificationResult] = []
+        for resource in self._resource_context.get_created_resources():
+            vr = self._verifier.verify_logical_resource(resource, region=region, profile=profile)
+            results.append(vr)
         return results
 
-    def _infer_service_from_resource_type(self, resource_type: str) -> str:
-        """Infer the AWS service from a resource type name."""
-        type_to_service = {
-            "VpcId": "ec2",
-            "SubnetId": "ec2",
-            "InstanceId": "ec2",
-            "GroupId": "ec2",
-            "InternetGatewayId": "ec2",
-            "RouteTableId": "ec2",
-            "BucketName": "s3",
-            "TableName": "dynamodb",
-            "FunctionName": "lambda",
-            "RoleName": "iam",
-            "DBInstanceIdentifier": "rds",
-            "ClusterArn": "ecs",
-        }
-        return type_to_service.get(resource_type, "ec2")
+    def _validate_all_commands(self, plan: ProvisioningPlan) -> list[str]:
+        """Validate all commands in the plan."""
+        issues = []
+        for cmd in plan.commands:
+            is_valid, cmd_issues = self._validator.validate_command(cmd)
+            if not is_valid:
+                issues.extend(cmd_issues)
+        return issues
 
-    def _discover_existing_resources(self, region: str) -> str:
-        """Discover existing AWS resources for context.
-
-        Args:
-            region: AWS region.
-
-        Returns:
-            Text description of existing resources.
-        """
+    def _discover_existing_resources(self, region: str, profile: str) -> str:
+        """Inspect region for existing default VPC, subnets, and security groups."""
         try:
             lines = []
-
-            # Discover default VPC
-            default_vpc = self._discovery.discover_default_vpc(region)
-            if default_vpc:
-                vpc_id = default_vpc.get("VpcId", "unknown")
-                lines.append(f"Default VPC: {vpc_id}")
-
-                # Discover subnets in default VPC
-                subnets = self._discovery.discover_subnets(region, vpc_id)
+            outcome, vpc, msg = self._discovery.discover_default_vpc(region=region, profile=profile)
+            if outcome == DiscoveryOutcome.EXISTS_AND_REUSABLE and vpc:
+                vpc_id = vpc.get("VpcId", "")
+                cidr = vpc.get("CidrBlock", "")
+                lines.append(f"Default VPC: {vpc_id} ({cidr}) [Available]")
+                # Register in context as DISCOVERED_ONLY so rollback never touches it
+                self._resource_context.register_resource(
+                    resource_ref="vpc.default",
+                    resource_type="vpc",
+                    service="ec2",
+                    resource_id=vpc_id,
+                    ownership=ResourceOwnership.DISCOVERED_ONLY,
+                    attributes={"CidrBlock": cidr},
+                )
+                subnets = self._discovery.discover_subnets(region=region, vpc_id=vpc_id, profile=profile)
                 if subnets:
-                    subnet_ids = [s.get("SubnetId", "") for s in subnets[:5]]
-                    lines.append(f"Subnets in default VPC: {', '.join(subnet_ids)}")
+                    subnet_strs = [f"{s.get('SubnetId')}({s.get('CidrBlock')})" for s in subnets[:3]]
+                    lines.append(f"Subnets in Default VPC: {', '.join(subnet_strs)}")
 
-                # Discover security groups in default VPC
-                sgs = self._discovery.discover_security_groups(region, vpc_id)
-                if sgs:
-                    for sg in sgs[:5]:
-                        sg_name = sg.get("GroupName", "")
-                        sg_id = sg.get("GroupId", "")
-                        lines.append(f"Security Group: {sg_name} ({sg_id})")
-
-            # Discover key pairs
-            key_pairs = self._discovery.discover_key_pairs(region)
-            if key_pairs:
-                kp_names = [kp.get("KeyName", "") for kp in key_pairs[:5]]
-                lines.append(f"Key Pairs: {', '.join(kp_names)}")
-
-            return "\n".join(lines) if lines else "No existing resources discovered"
-
+            return "\n".join(lines) if lines else "None discovered"
         except Exception as e:
-            logger.warning(f"Resource discovery failed: {e}")
-            return "Resource discovery failed (may need AWS credentials)"
+            logger.warning("Resource discovery encountered error: %s", e)
+            return "Discovery skipped or unavailable"
 
-    def _generate_dry_run_explanation(self, plan: ProvisioningPlan) -> str:
-        """Generate explanation for dry-run mode."""
-        lines = [
-            "## 🔍 Dry Run Analysis",
-            "",
-            f"**Request:** {plan.user_request}",
-            f"**Interpreted Intent:** {plan.intent}",
-            f"**Region:** {plan.aws_region}",
-            f"**Risk Level:** {plan.risk_level.value}",
-            "",
-        ]
-
-        if plan.resources:
-            lines.append("### Resources That Would Be Affected")
-            for r in plan.resources:
-                name = r.resource_name or "auto-named"
-                lines.append(f"- **{r.service.upper()} {r.resource_type}**: {name}")
-            lines.append("")
-
-        if plan.commands:
-            lines.append("### AWS CLI Commands That Would Be Executed")
-            for i, cmd in enumerate(plan.commands, 1):
-                lines.append(f"\n**{i}. {cmd.description}** ({cmd.operation_category.value})")
-                lines.append(f"```bash\n{cmd.to_display_string()}\n```")
-            lines.append("")
-
-        if plan.dependencies:
-            lines.append("### Resource Dependencies")
-            for dep in plan.dependencies:
-                lines.append(f"- {dep.get('from', '?')} → {dep.get('to', '?')}")
-            lines.append("")
-
-        if plan.assumptions:
-            lines.append("### Assumptions")
-            for a in plan.assumptions:
-                lines.append(f"- {a}")
-            lines.append("")
-
-        if plan.cost_warnings:
-            lines.append("### 💰 Cost Warnings")
-            for w in plan.cost_warnings:
-                lines.append(f"- {w}")
-            lines.append("")
-
-        if plan.rollback_strategy:
-            lines.append("### 🔄 Rollback Plan")
-            for step in sorted(plan.rollback_strategy, key=lambda s: s.order, reverse=True):
-                lines.append(f"- {step.resource_description}")
-            lines.append("")
-
-        if plan.verification_steps:
-            lines.append("### ✅ Verification Commands")
-            for v in plan.verification_steps:
-                lines.append(f"- `{v.to_display_string()}`")
-            lines.append("")
-
-        lines.append("> **ℹ️ This is a dry run.** No changes were made to AWS. "
-                      "Switch off Dry Run mode and re-submit to execute.")
-
-        return "\n".join(lines)
-
-    def _format_approval_message(
-        self, plan: ProvisioningPlan, approval_info: dict
+    def _generate_dry_run_explanation(
+        self, plan: ProvisioningPlan, profile: str, region: str
     ) -> str:
-        """Format the approval request message."""
+        """Format the dry run explanation."""
         lines = [
-            "## ⏳ Approval Required",
-            "",
-            f"**Request:** {plan.user_request}",
+            "### 🔍 Dry Run Analysis (No Changes Made)",
             f"**Intent:** {plan.intent}",
-            "",
-            "---",
-            "",
-            f"**Region:** `{plan.aws_region}`",
+            f"**Target AWS Profile:** `{profile}`",
+            f"**Target AWS Region:** `{region}`",
             f"**Risk Level:** `{plan.risk_level.value}`",
             f"**Destructive Operations:** {'⚠️ Yes' if plan.destructive_operations else '✅ No'}",
-            f"**Approval Type:** {approval_info.get('approval_type', 'standard')}",
+            f"**Required Approval Type:** `{plan.approval_type.value}`",
             "",
+            "**Planned AWS CLI Commands:**",
         ]
-
-        if plan.resources:
-            lines.append("### Resources")
-            for r in plan.resources:
-                name = r.resource_name or "auto-named"
-                lines.append(f"- **{r.service.upper()} {r.resource_type}**: {name}")
-            lines.append("")
-
-        if plan.commands:
-            lines.append("### Commands to Execute")
-            for i, cmd in enumerate(plan.commands, 1):
-                lines.append(f"\n**{i}. {cmd.description}**")
-                lines.append(f"```bash\n{cmd.to_display_string()}\n```")
-            lines.append("")
+        for idx, cmd in enumerate(plan.commands, 1):
+            badge = f"[{cmd.operation_category.value}]"
+            lines.append(f"{idx}. {badge} `{cmd.to_display_string(profile=profile, region=region)}`")
+            if cmd.description:
+                lines.append(f"   _{cmd.description}_")
 
         if plan.assumptions:
-            lines.append("### Assumptions")
+            lines.extend(["", "**Assumptions:**"])
             for a in plan.assumptions:
                 lines.append(f"- {a}")
-            lines.append("")
 
         if plan.cost_warnings:
-            lines.append("### 💰 Cost Warnings")
+            lines.extend(["", "**💰 Cost Warnings:**"])
             for w in plan.cost_warnings:
                 lines.append(f"- ⚠️ {w}")
-            lines.append("")
 
+        lines.extend([
+            "",
+            "ℹ️ _This was a dry run. Uncheck 'Dry Run' in the sidebar and click Execute to apply these changes to AWS._"
+        ])
         return "\n".join(lines)
 
     def _save_to_history(
@@ -674,36 +522,25 @@ class AgentOrchestrator:
         plan: ProvisioningPlan,
         result: ExecutionResult,
         explanation: str,
+        profile: str,
+        region: str,
     ) -> None:
-        """Save execution to history store."""
+        """Save sanitized execution record to persistent history."""
         try:
             entry = ExecutionHistoryEntry(
                 execution_id=result.execution_id,
-                timestamp=result.timestamp,
+                timestamp=datetime.now(timezone.utc),
                 user_request=plan.user_request,
                 aws_account_id=plan.aws_account_id,
-                aws_region=plan.aws_region,
+                aws_profile=profile,
+                aws_region=region,
                 intent=plan.intent,
                 operation_type=plan.operation_type,
                 plan=plan,
-                approval_status=ApprovalStatus.APPROVED,
+                approval_status=ApprovalStatus.APPROVED if result.status != ExecutionStatus.DRY_RUN else ApprovalStatus.AUTO_APPROVED,
                 execution_result=result,
                 explanation=explanation,
             )
             self._history_store.save_entry(entry)
         except Exception as e:
-            logger.error(f"Failed to save to history: {e}")
-
-    def get_execution_history(self, limit: int = 20) -> list[ExecutionHistoryEntry]:
-        """Get recent execution history."""
-        return self._history_store.list_entries(limit=limit)
-
-    def get_session_resources(self) -> dict[str, str]:
-        """Get resources created in this session."""
-        return self._session_resources.copy()
-
-    def clear_session(self) -> None:
-        """Clear session state."""
-        self._conversation_history.clear()
-        self._session_resources.clear()
-        logger.info("Session cleared")
+            logger.error("Failed to save execution history: %s", e)

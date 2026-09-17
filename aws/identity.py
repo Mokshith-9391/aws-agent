@@ -64,6 +64,10 @@ class AWSIdentityManager:
             if region:
                 args.extend(['--region', region])
 
+            from config.settings import get_settings
+            settings = get_settings()
+            env = settings.get_aws_env(profile=profile, region=region) if settings else None
+
             result = subprocess.run(
                 args,
                 stdout=subprocess.PIPE,
@@ -71,6 +75,7 @@ class AWSIdentityManager:
                 text=True,
                 shell=False,
                 timeout=15,
+                env=env,
             )
 
             if result.returncode != 0:

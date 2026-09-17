@@ -73,3 +73,78 @@ class TestCLIValidator:
         )
         is_valid, issues = self.validator.validate_command(cmd)
         assert not is_valid
+
+    def test_category_override_destructive(self):
+        # LLM falsely claims delete-bucket is WRITE
+        cmd = CLICommand(
+            service="s3api",
+            action="delete-bucket",
+            parameters={"bucket": "my-bucket"},
+            description="Delete bucket",
+            operation_category=OperationCategory.WRITE,
+        )
+        is_valid, issues = self.validator.validate_command(cmd)
+        assert is_valid
+        # Category MUST be deterministically overridden to DESTRUCTIVE
+        assert cmd.operation_category == OperationCategory.DESTRUCTIVE
+
+    def test_category_override_terminate_instances(self):
+        # LLM falsely claims terminate-instances is READ_ONLY
+        cmd = CLICommand(
+            service="ec2",
+            action="terminate-instances",
+            parameters={"instance-ids": ["i-1234567890abcdef0"]},
+            description="Terminate instance",
+            operation_category=OperationCategory.READ_ONLY,
+        )
+        is_valid, issues = self.validator.validate_command(cmd)
+        assert is_valid
+        assert cmd.operation_category == OperationCategory.DESTRUCTIVE
+
+    def test_semantic_validation_invalid_cidr(self):
+        cmd = CLICommand(
+            service="ec2",
+            action="create-vpc",
+            parameters={"cidr-block": "invalid-cidr"},
+            description="Bad CIDR",
+            operation_category=OperationCategory.WRITE,
+        )
+        is_valid, issues = self.validator.validate_command(cmd)
+        assert not is_valid
+        assert any("cidr" in i.lower() for i in issues)
+
+    def test_semantic_validation_invalid_vpc_id(self):
+        cmd = CLICommand(
+            service="ec2",
+            action="delete-vpc",
+            parameters={"vpc-id": "bad-id-123"},
+            description="Bad VPC ID",
+            operation_category=OperationCategory.DESTRUCTIVE,
+        )
+        is_valid, issues = self.validator.validate_command(cmd)
+        assert not is_valid
+        assert any("vpc id" in i.lower() for i in issues)
+
+    def test_semantic_validation_invalid_port(self):
+        cmd = CLICommand(
+            service="ec2",
+            action="authorize-security-group-ingress",
+            parameters={"group-name": "my-sg", "protocol": "tcp", "port": "99999", "cidr": "0.0.0.0/0"},
+            description="Port out of range",
+            operation_category=OperationCategory.WRITE,
+        )
+        is_valid, issues = self.validator.validate_command(cmd)
+        assert not is_valid
+        assert any("port" in i.lower() for i in issues)
+
+    def test_semantic_validation_invalid_s3_bucket_name(self):
+        cmd = CLICommand(
+            service="s3api",
+            action="create-bucket",
+            parameters={"bucket": "INVALID_NAME_WITH_CAPS"},
+            description="Bad bucket name",
+            operation_category=OperationCategory.WRITE,
+        )
+        is_valid, issues = self.validator.validate_command(cmd)
+        assert not is_valid
+        assert any("bucket name" in i.lower() for i in issues)

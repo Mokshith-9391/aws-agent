@@ -458,11 +458,12 @@ def process_agent_response(response: AgentResponse):
     # Check if approval is needed
     if response.requires_approval and response.plan:
         st.session_state.pending_plan = response.plan
-        # Determine approval type
-        if response.plan.has_destructive_commands and response.plan.risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL):
-            st.session_state.pending_approval_type = "explicit_confirmation"
+        # Authoritative approval decision directly from backend
+        appr_type = getattr(response, "approval_type", None)
+        if hasattr(appr_type, "value"):
+            st.session_state.pending_approval_type = appr_type.value
         else:
-            st.session_state.pending_approval_type = "standard"
+            st.session_state.pending_approval_type = str(appr_type or "standard")
     else:
         st.session_state.pending_plan = None
         st.session_state.pending_approval_type = None
@@ -477,9 +478,15 @@ def render_approval_controls():
 
     st.divider()
 
+    # Display effective execution context immediately before approval
+    st.info(
+        f"🎯 **Target AWS Environment:** Profile: `{st.session_state.aws_profile}` | "
+        f"Region: `{st.session_state.aws_region}`"
+    )
+
     if approval_type == "explicit_confirmation":
-        st.error("⚠️ **DESTRUCTIVE OPERATION** - Explicit confirmation required")
-        st.markdown("Type `CONFIRM DELETE` in the chat to proceed, or click Cancel.")
+        st.error("⚠️ **DESTRUCTIVE / HIGH-RISK OPERATION** — Explicit confirmation required")
+        st.markdown("Type `CONFIRM DELETE` in the chat input below to proceed, or click **Cancel**.")
 
         if st.button("🚫 Cancel", type="primary", use_container_width=True):
             cancel_pending_plan()
@@ -498,7 +505,7 @@ def render_approval_controls():
 
 
 def execute_pending_plan():
-    """Execute the pending approved plan."""
+    """Execute the pending approved plan with explicit profile and region."""
     plan = st.session_state.pending_plan
     if not plan:
         return
@@ -513,13 +520,14 @@ def execute_pending_plan():
 
     st.session_state.messages.append({
         "role": "assistant",
-        "content": "⚡ **Executing approved plan...**",
+        "content": f"⚡ **Executing approved plan using profile `{st.session_state.aws_profile}` and region `{st.session_state.aws_region}`...**",
     })
 
     with st.spinner("🚀 Executing AWS commands..."):
         response = orchestrator.execute_approved_plan(
             plan=plan,
             region=st.session_state.aws_region,
+            profile=st.session_state.aws_profile,
             learning_mode=st.session_state.learning_mode,
         )
 
