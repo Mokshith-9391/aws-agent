@@ -78,6 +78,106 @@ class UnsupportedResourceTypeError(ValueError):
     pass
 
 
+class UnsupportedConfigurationError(ValueError):
+    """Raised when desired-state configuration contains unknown, dangerous, or unapproved fields."""
+    pass
+
+
+RESOURCE_CONFIG_SCHEMAS: dict[tuple[str, str], set[str]] = {
+    ("ec2", "instance"): {
+        "instance_type", "instance-type",
+        "subnet_id", "subnet-id",
+        "security_group_ids", "security-group-ids",
+        "key_name", "key-name",
+        "user_data", "user-data",
+        "count",
+        "name",
+        "architecture",
+        "image_id", "image-id",
+    },
+    ("ec2", "key_pair"): {
+        "key_name", "key-name",
+        "name",
+    },
+    ("vpc", "vpc"): {
+        "cidr_block", "cidr-block",
+        "name",
+    },
+    ("vpc", "subnet"): {
+        "vpc_id", "vpc-id", "vpc_ref",
+        "cidr_block", "cidr-block",
+        "availability_zone", "availability-zone",
+        "name",
+    },
+    ("vpc", "internet_gateway"): {
+        "vpc_id", "vpc-id", "vpc_ref",
+        "name",
+    },
+    ("vpc", "route_table"): {
+        "vpc_id", "vpc-id", "vpc_ref",
+        "name",
+    },
+    ("vpc", "security_group"): {
+        "vpc_id", "vpc-id", "vpc_ref",
+        "group_name", "group-name",
+        "description",
+        "ingress_rules", "ingress",
+        "ports", "port",
+        "cidr", "cidr_block", "cidr-block",
+        "protocol",
+        "name",
+    },
+    ("s3", "bucket"): {
+        "bucket", "bucket_name", "bucket-name",
+        "region",
+        "acl",
+        "name",
+    },
+    ("iam", "role"): {
+        "role_name", "role-name",
+        "assume_role_policy_document", "assume-role-policy-document",
+        "description",
+        "name",
+    },
+    ("iam", "policy"): {
+        "policy_name", "policy-name",
+        "policy_document", "policy-document",
+        "description",
+        "name",
+    },
+    ("dynamodb", "table"): {
+        "table_name", "table-name",
+        "key_schema", "key-schema",
+        "attribute_definitions", "attribute-definitions",
+        "billing_mode", "billing-mode",
+        "name",
+    },
+}
+
+READ_CONFIG_SCHEMAS: dict[tuple[str, str], set[str]] = {
+    ("ec2", "instance"): {"instance_ids", "instance-ids", "filters"},
+    ("ec2", "ami"): {"owners", "filters", "image_ids", "image-ids"},
+    ("s3", "bucket"): {"prefix", "max_buckets"},
+    ("vpc", "vpc"): {"vpc_ids", "vpc-ids", "filters"},
+    ("vpc", "subnet"): {"subnet_ids", "subnet-ids", "filters"},
+    ("vpc", "security_group"): {"group_ids", "group-ids", "filters"},
+    ("iam", "role"): {"role_name", "role-name"},
+    ("iam", "policy"): {"policy_arn", "policy-arn"},
+    ("dynamodb", "table"): {"table_name", "table-name"},
+}
+
+DELETE_CONFIG_SCHEMAS: dict[tuple[str, str], set[str]] = {
+    ("s3", "bucket"): {"bucket", "bucket_name", "bucket-name"},
+    ("ec2", "instance"): {"instance_ids", "instance-ids"},
+    ("vpc", "vpc"): {"vpc_id", "vpc-id"},
+    ("vpc", "subnet"): {"subnet_id", "subnet-id"},
+    ("vpc", "security_group"): {"group_id", "group-id"},
+    ("iam", "role"): {"role_name", "role-name"},
+    ("iam", "policy"): {"policy_arn", "policy-arn"},
+    ("dynamodb", "table"): {"table_name", "table-name"},
+}
+
+
 class PlanCompiler:
     """Compiles desired infrastructure state into deterministic executable CLICommands."""
 
@@ -112,6 +212,7 @@ class PlanCompiler:
 
         Raises:
             UnsupportedResourceTypeError: If any requested resource type is unknown.
+            UnsupportedConfigurationError: If any configuration contains unapproved fields.
         """
         logger.info(
             "Compiling desired-state plan: intent='%s', resources=%d",
@@ -130,7 +231,7 @@ class PlanCompiler:
         # Mapping from logical_ref to the command_id that creates it
         ref_to_command_id: dict[str, str] = {}
 
-        # ── 1. Validate All Resource Types First (Fail Fast) ─────────
+        # ── 1. Validate All Resource Types & Configuration Schemas ────
         validated_resources: list[tuple[DesiredResource, str, ResourceTypeDefinition]] = []
         for res in desired.resources:
             lookup = None
@@ -147,6 +248,31 @@ class PlanCompiler:
                     f"(service '{res.service or 'unspecified'}'). "
                     f"Supported types: {[rt.resource_type for rt in self.registry.get_all_resource_definitions()]}"
                 )
+
+            svc_key = lookup[0]
+            rtype_key = lookup[1].resource_type
+
+            # Strict Configuration Schema Validation (Requirement 2 & 3)
+            cfg = res.configuration or {}
+            if desired.operation_type in (OperationType.LIST, OperationType.DESCRIBE):
+                allowed_keys = READ_CONFIG_SCHEMAS.get((svc_key, rtype_key), set())
+            elif desired.operation_type == OperationType.DELETE:
+                allowed_keys = DELETE_CONFIG_SCHEMAS.get((svc_key, rtype_key), set())
+            else:
+                allowed_keys = RESOURCE_CONFIG_SCHEMAS.get((svc_key, rtype_key))
+
+            if allowed_keys is None:
+                raise UnsupportedResourceTypeError(
+                    f"Resource type '{svc_key}.{rtype_key}' lacks an authoritative configuration schema."
+                )
+
+            unknown_keys = set(cfg.keys()) - allowed_keys
+            if unknown_keys:
+                raise UnsupportedConfigurationError(
+                    f"Unknown or unapproved configuration field(s) {sorted(unknown_keys)} for resource '{svc_key}.{rtype_key}'. "
+                    f"Allowed fields: {sorted(allowed_keys)}"
+                )
+
             validated_resources.append((res, lookup[0], lookup[1]))
 
         # ── 2. Compile Resources into Commands & Logical Resources ───
@@ -278,7 +404,7 @@ class PlanCompiler:
                     )
                 )
 
-        return ProvisioningPlan(
+        plan = ProvisioningPlan(
             plan_id=plan_id,
             user_request=user_request,
             intent=desired.intent,
@@ -305,6 +431,8 @@ class PlanCompiler:
             verification_steps=verification_steps,
             cost_warnings=cost_warnings,
         )
+        plan.plan_hash = plan.compute_plan_fingerprint()
+        return plan
 
     def _compile_create_resource(
         self,
@@ -595,32 +723,6 @@ class PlanCompiler:
             )
             return [cmd], ver_cmd
 
-        # Generic fallback using ResourceTypeDefinition metadata
-        rt_def = self.registry.get_resource_type(svc_name, resource_type)
-        if rt_def and rt_def.create_action:
-            cmd = CLICommand(
-                command_id=cmd_id,
-                service=rt_def.cli_service,
-                action=rt_def.create_action,
-                parameters=cfg,
-                description=f"Create {svc_name} {resource_type}",
-                operation_category=classify_aws_action(rt_def.cli_service, rt_def.create_action),
-                resource_ref=ref,
-                depends_on=dep_command_ids,
-                output_key=rt_def.id_field,
-            )
-            ver_cmd = None
-            if rt_def.describe_action:
-                ver_cmd = CLICommand(
-                    command_id=f"ver-{cmd_id}",
-                    service=rt_def.cli_service,
-                    action=rt_def.describe_action,
-                    parameters={},
-                    description=f"Verify {svc_name} {resource_type}",
-                    operation_category=OperationCategory.READ_ONLY,
-                )
-            return [cmd], ver_cmd
-
         raise UnsupportedResourceTypeError(
             f"Cannot build creation command for unsupported resource type '{resource_type}' in service '{svc_name}'."
         )
@@ -633,8 +735,8 @@ class PlanCompiler:
         cmd_id: str,
         region: str,
         profile: str,
-    ) -> Optional[CLICommand]:
-        """Compile a read-only list/describe operation."""
+    ) -> CLICommand:
+        """Compile a read-only list/describe operation using deterministic builders."""
         if svc_name == "ec2" and resource_type in ("instance", "ami"):
             return build_describe_instances_command(
                 instance_ids=cfg.get("instance_ids") or cfg.get("instance-ids"),
@@ -644,45 +746,97 @@ class PlanCompiler:
         elif svc_name == "s3" and resource_type == "bucket":
             return build_list_buckets_command(command_id=cmd_id)
         elif svc_name == "vpc" and resource_type == "vpc":
+            params: dict[str, Any] = {}
+            vpc_ids = cfg.get("vpc_ids") or cfg.get("vpc-ids")
+            if vpc_ids:
+                params["vpc-ids"] = vpc_ids
+            if "filters" in cfg:
+                params["filters"] = cfg["filters"]
             return CLICommand(
                 command_id=cmd_id,
                 service="ec2",
                 action="describe-vpcs",
-                parameters=cfg,
+                parameters=params,
                 description="Describe VPCs in region",
                 operation_category=OperationCategory.READ_ONLY,
             )
         elif svc_name == "vpc" and resource_type == "subnet":
+            params = {}
+            subnet_ids = cfg.get("subnet_ids") or cfg.get("subnet-ids")
+            if subnet_ids:
+                params["subnet-ids"] = subnet_ids
+            if "filters" in cfg:
+                params["filters"] = cfg["filters"]
             return CLICommand(
                 command_id=cmd_id,
                 service="ec2",
                 action="describe-subnets",
-                parameters=cfg,
+                parameters=params,
                 description="Describe Subnets in region",
                 operation_category=OperationCategory.READ_ONLY,
             )
         elif svc_name == "vpc" and resource_type == "security_group":
+            params = {}
+            group_ids = cfg.get("group_ids") or cfg.get("group-ids")
+            if group_ids:
+                params["group-ids"] = group_ids
+            if "filters" in cfg:
+                params["filters"] = cfg["filters"]
             return CLICommand(
                 command_id=cmd_id,
                 service="ec2",
                 action="describe-security-groups",
-                parameters=cfg,
+                parameters=params,
                 description="Describe Security Groups in region",
                 operation_category=OperationCategory.READ_ONLY,
             )
-
-        rt_def = self.registry.get_resource_type(svc_name, resource_type)
-        if rt_def and (rt_def.list_action or rt_def.describe_action):
-            action = rt_def.list_action or rt_def.describe_action
+        elif svc_name == "iam" and resource_type == "role":
+            role_name = cfg.get("role_name") or cfg.get("role-name")
+            if role_name:
+                return build_get_role_command(role_name=role_name, command_id=cmd_id)
             return CLICommand(
                 command_id=cmd_id,
-                service=rt_def.cli_service,
-                action=action,
-                parameters=cfg,
-                description=f"List/describe {svc_name} {resource_type}",
+                service="iam",
+                action="list-roles",
+                parameters={},
+                description="List IAM Roles",
                 operation_category=OperationCategory.READ_ONLY,
             )
-        return None
+        elif svc_name == "iam" and resource_type == "policy":
+            policy_arn = cfg.get("policy_arn") or cfg.get("policy-arn")
+            if policy_arn:
+                return CLICommand(
+                    command_id=cmd_id,
+                    service="iam",
+                    action="get-policy",
+                    parameters={"policy-arn": policy_arn},
+                    description=f"Get Policy {policy_arn}",
+                    operation_category=OperationCategory.READ_ONLY,
+                )
+            return CLICommand(
+                command_id=cmd_id,
+                service="iam",
+                action="list-policies",
+                parameters={},
+                description="List IAM Policies",
+                operation_category=OperationCategory.READ_ONLY,
+            )
+        elif svc_name == "dynamodb" and resource_type == "table":
+            tbl_name = cfg.get("table_name") or cfg.get("table-name")
+            if tbl_name:
+                return build_describe_table_command(table_name=tbl_name, command_id=cmd_id)
+            return CLICommand(
+                command_id=cmd_id,
+                service="dynamodb",
+                action="list-tables",
+                parameters={},
+                description="List DynamoDB tables",
+                operation_category=OperationCategory.READ_ONLY,
+            )
+
+        raise UnsupportedResourceTypeError(
+            f"Cannot build read command for unsupported resource type '{resource_type}' in service '{svc_name}'."
+        )
 
     def _compile_delete_command(
         self,
@@ -692,10 +846,10 @@ class PlanCompiler:
         res_name: Optional[str],
         cmd_id: str,
         ref: str,
-    ) -> Optional[CLICommand]:
-        """Compile a deletion command."""
+    ) -> CLICommand:
+        """Compile a deletion command using deterministic builders."""
         if svc_name == "s3" and resource_type == "bucket":
-            bucket = res_name or cfg.get("bucket") or cfg.get("bucket_name") or ""
+            bucket = res_name or cfg.get("bucket") or cfg.get("bucket_name") or cfg.get("bucket-name") or ""
             return build_delete_bucket_command(bucket_name=bucket, command_id=cmd_id, resource_ref=ref)
 
         elif svc_name == "ec2" and resource_type == "instance":
@@ -714,15 +868,18 @@ class PlanCompiler:
             group_id = cfg.get("group_id") or cfg.get("group-id") or res_name or ""
             return build_delete_security_group_command(group_id=group_id, command_id=cmd_id, resource_ref=ref)
 
-        rt_def = self.registry.get_resource_type(svc_name, resource_type)
-        if rt_def and rt_def.delete_action:
-            return CLICommand(
-                command_id=cmd_id,
-                service=rt_def.cli_service,
-                action=rt_def.delete_action,
-                parameters=cfg,
-                description=f"Delete {svc_name} {resource_type}",
-                operation_category=OperationCategory.DESTRUCTIVE,
-                resource_ref=ref,
-            )
-        return None
+        elif svc_name == "iam" and resource_type == "role":
+            role_name = res_name or cfg.get("role_name") or cfg.get("role-name") or ""
+            return build_delete_role_command(role_name=role_name, command_id=cmd_id, resource_ref=ref)
+
+        elif svc_name == "iam" and resource_type == "policy":
+            policy_arn = cfg.get("policy_arn") or cfg.get("policy-arn") or res_name or ""
+            return build_delete_policy_command(policy_arn=policy_arn, command_id=cmd_id, resource_ref=ref)
+
+        elif svc_name == "dynamodb" and resource_type == "table":
+            table_name = res_name or cfg.get("table_name") or cfg.get("table-name") or ""
+            return build_delete_table_command(table_name=table_name, command_id=cmd_id, resource_ref=ref)
+
+        raise UnsupportedResourceTypeError(
+            f"Cannot build deletion command for unsupported resource type '{resource_type}' in service '{svc_name}'."
+        )

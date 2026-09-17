@@ -8,7 +8,7 @@
 [![Streamlit](https://img.shields.io/badge/UI-Streamlit-FF4B4B.svg)](https://streamlit.io/)
 [![AWS CLI](https://img.shields.io/badge/AWS%20CLI-v2-232F3E.svg?logo=amazon-aws)](https://aws.amazon.com/cli/)
 [![Pydantic v2](https://img.shields.io/badge/validation-Pydantic%20v2-E92063.svg)](https://docs.pydantic.dev/)
-[![Tests](https://img.shields.io/badge/tests-116%20passed-brightgreen.svg)]()
+[![Tests](https://img.shields.io/badge/tests-124%20passed-brightgreen.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 [Features](#-key-features) • [Architecture](#-architecture) • [Quick Start](#-quick-start) • [Security Model](#-hardened-security-model) • [Supported Services](#-supported-aws-services) • [Walkthrough](#-step-by-step-walkthrough) • [Testing](#-testing)
@@ -39,13 +39,15 @@ The agent reasons about cloud architectures, queries live AWS state, builds a di
 
 $$\text{Natural Language} \longrightarrow \text{LLM Intent / Desired State} \longrightarrow \text{Structured Plan} \longrightarrow \text{Deterministic Python Compilers \& Builders} \longrightarrow \text{DAG} \longrightarrow \text{Policy/Validation} \longrightarrow \text{Approval} \longrightarrow \text{AWS CLI Execution} \longrightarrow \text{AWS Truth} \longrightarrow \text{Verification} \longrightarrow \text{Controlled Rollback}$$
 
-* **The LLM is NEVER authoritative for executable CLI commands.** The LLM is strictly confined to intent understanding and desired-state specification (`DesiredResource`: `logical_ref`, `resource_type`, `configuration`, `dependencies`). It is prohibited from authoring executable CLI syntax, flags, action names, resource IDs, rollback commands, or security policies.
-* **Deterministic Python Compilers & Builders:** Application code (`agent/compiler.py` + `services/`) is the sole authority for translating desired resources into validated, executable `CLICommand` objects. Any unapproved or unsupported resource type is rejected immediately before command generation.
+* **The LLM is NEVER authoritative for executable CLI commands.** The LLM is strictly confined to intent understanding and desired-state specification (`DesiredResource`: `logical_ref`, `resource_type`, `configuration`, `dependencies`). It is strictly prohibited from authoring executable CLI syntax, flags, action names, resource IDs, rollback commands, or security policies. Any LLM-emitted executable commands are discarded before compilation.
+* **Deterministic Python Compilers & Strict Schemas:** Application code (`agent/compiler.py` + `services/`) is the sole authority for translating desired resources into validated, executable `CLICommand` objects. Strict per-resource configuration schemas reject any unknown/unapproved parameters (`UnsupportedConfigurationError`), and generic parameter passthroughs have been eliminated.
+* **Cryptographic Plan Fingerprinting & Anti-Tamper Verification:** Plans generate a canonical SHA-256 fingerprint (`plan_hash`) binding plan details, commands, and logical resources. The orchestrator re-verifies the fingerprint and an `ApprovalToken` at runtime (Step 0) before any command runs, rejecting post-approval tampering.
 * **Allowlist Closure:** Execution service allowlists are strictly bounded by explicit action sets (`ALLOWED_SERVICES = set(ALLOWED_ACTIONS.keys())`). Any service or action not explicitly listed with approved CRUD actions is rejected.
+* **Authoritative Live Mode Safety Gate:** A strict pre-flight gate (`LiveModeSafetyGate`) validates AWS CLI availability, allowlist closure, and compiler builder completeness before Live Mode execution is permitted.
 * **AWS CLI performs all real-world operations.** Subprocess calls use tokenized argument arrays with `shell=False`—eliminating command injection vulnerabilities. All calls explicitly propagate `--profile` and `--region` flags alongside sanitized environment variables.
 * **Backend Approval Re-Validation:** Destructive plans require explicit `CONFIRM DELETE` tokens checked directly in `orchestrator.execute_approved_plan()`, preventing UI bypasses.
 * **AWS is the source of truth.** The agent verifies resource creation through targeted, service-specific AWS API calls (`describe-*`, `head-*`), never blindly trusting return codes or falling back to arbitrary types.
-* **Controlled Rollback:** Undoes created infrastructure in reverse dependency order, strictly scoped to resources marked `ResourceOwnership.CREATED_BY_THIS_PLAN`. Never touches existing or reused resources.
+* **Controlled Rollback with Safe Defaults:** Automatic rollback is disabled by default (`AUTO_ROLLBACK_ON_FAILURE = False`). Partial failures transition to `ROLLBACK_PENDING`, listing candidate resources to delete and requiring explicit `"CONFIRM ROLLBACK"` confirmation. Rollback is strictly scoped to `ResourceOwnership.CREATED_BY_THIS_PLAN`.
 
 ---
 
@@ -65,6 +67,9 @@ $$\text{Natural Language} \longrightarrow \text{LLM Intent / Desired State} \lon
   * `AUTO`: Read-only operations (`describe-*`, `list-*`) run automatically.
   * `STANDARD`: Infrastructure write operations (`create-*`, `run-instances`) require interactive UI approval.
   * `EXPLICIT_CONFIRMATION`: Destructive operations (`delete-*`, `terminate-*`) require typed `CONFIRM DELETE`.
+* 🔐 **Cryptographic Plan Fingerprinting (`compute_plan_fingerprint`) & Approval Tokens:** Computes canonical SHA-256 digests over the entire plan structure. Enforces tamper detection before execution (Step 0) and issues plan-bound `ApprovalToken` instances.
+* 🛡️ **Authoritative Live Mode Safety Gate (`LiveModeSafetyGate`):** Enforces a strict pre-flight gate verifying AWS CLI availability, complete allowlist closure (`ALLOWED_SERVICES == set(ALLOWED_ACTIONS.keys())`), and compiler completeness before Live Mode execution can run.
+* 🛑 **Safe Failure Mode & Explicit Rollback (`ROLLBACK_PENDING`):** Mid-flight failures halt and transition to `ROLLBACK_PENDING` rather than performing blind automatic rollbacks (`AUTO_ROLLBACK_ON_FAILURE = False`). Populates `rollback_candidates` and requires explicit confirmation (`CONFIRM ROLLBACK`).
 * 🔄 **Reverse Topological Rollback Engine (`RollbackEngine`):** Undoes created infrastructure in reverse dependency order, strictly scoped to resources marked `ResourceOwnership.CREATED_BY_THIS_PLAN`. Never deletes existing or reused resources.
 * 🔍 **Multi-Service Ground-Truth Verification (`ResourceVerifier`):** Verifies newly created resources against live AWS state (`EC2`, `S3`, `VPC`, `Subnet`, `Security Group`, `IGW`, `IAM`, `DynamoDB`). Unknown types return explicit `UNSUPPORTED_TYPE` without EC2 fallback.
 * 👤 **100% Profile and Region Propagation:** User-selected AWS profile and region in Streamlit propagate consistently to STS identity checks, discovery, planning, CLI argument arrays, and environment variables.
@@ -232,7 +237,7 @@ Open [http://localhost:8501](http://localhost:8501) in your browser.
 
 ## 🧪 Testing
 
-The repository includes an extensive automated test suite of **116 unit and end-to-end scenario tests** (plus 3 gated live AWS integration tests). Tests mock all external AWS CLI and LLM interactions, allowing 100% offline execution without AWS credentials or charges:
+The repository includes an extensive automated test suite of **124 unit and end-to-end scenario tests** (plus 4 gated live AWS integration tests). Tests mock all external AWS CLI and LLM interactions, allowing 100% offline execution without AWS credentials or charges:
 
 ```bash
 # Run all unit and scenario tests
@@ -240,7 +245,7 @@ python -m pytest tests/ -v
 ```
 
 ### Test Suite Breakdown
-* `tests/test_compiler.py`: Validates deterministic compilation from desired state across S3 (us-east-1 vs non-us-east-1 LocationConstraint), EC2, custom VPC chains, IAM roles, and DynamoDB tables; verifies `UnsupportedResourceTypeError` on invalid resource types.
+* `tests/test_compiler.py`: Validates deterministic compilation from desired state across S3 (us-east-1 vs non-us-east-1 LocationConstraint), EC2, custom VPC chains, IAM roles, and DynamoDB tables; verifies strict configuration schema enforcement, rejection of unknown parameters, deterministic SHA-256 plan fingerprinting, and `UnsupportedResourceTypeError` on invalid resource types.
 * `tests/test_cli_executor.py`: Validates tokenized subprocess calls (`shell=False`), allowlist rejection for unregistered services (`route53`, `fake_svc`), unapproved actions, JSON parameter serialization, explicit profile and region flag/env propagation, unresolved placeholder blocking, and secret redaction.
 * `tests/test_dependency_graph.py`: Validates topological sorting, 3-color DFS cycle detection, missing dependency detection, and transitive dependent skipping.
 * `tests/test_resource_context.py`: Validates recursive placeholder resolution across nested dictionaries, lists, and strings, unresolved placeholder detection, and ownership tracking.
@@ -250,7 +255,8 @@ python -m pytest tests/ -v
 * `tests/test_validator.py`: Validates deterministic action categorization, category overrides, command injection blocking, and semantic parameter validation.
 * `tests/test_parser.py`: Validates prompt injection defenses, input sanitization, length boundaries, and region detection.
 * `tests/test_services.py`: Validates AWS service registry metadata and resource type definitions.
-* `tests/test_e2e_scenario.py`: Validates complete lifecycle for Scenarios A through K (S3, EC2 in default VPC, full custom VPC stack, read-only discovery, destructive deletion, blocked dangerous requests, partial failure mid-flight skipping, prompt injection defense, backend confirmation token re-validation, unsupported resource type handling, and mid-flight auto-rollback).
+* `tests/test_planner.py`: Validates LLM command stripping (discards LLM-emitted CLI commands, flags, rollback commands), category downgrade overrides, and unsupported resource handling.
+* `tests/test_e2e_scenario.py`: Validates complete lifecycle for Scenarios A through O (S3, EC2 in default VPC, full custom VPC stack, read-only discovery, destructive deletion, blocked dangerous requests, partial failure mid-flight skipping, prompt injection defense, backend confirmation token re-validation, unsupported resource type handling, auto-rollback, plan fingerprint tamper rejection, ApprovalToken validation, default `ROLLBACK_PENDING` state with explicit rollback confirmation, and LiveModeSafetyGate blocking).
 * `tests/test_integration_aws.py`: Optional live AWS integration testing (gated behind `AWS_INTEGRATION_TESTS=true`).
 
 ---
@@ -272,7 +278,8 @@ aws-agent/
 ├── agent/
 │   ├── __init__.py
 │   ├── models.py               # Pydantic Contracts (Plan, Command, Result, LogicalResource, DesiredState)
-│   ├── compiler.py             # Deterministic Plan Compiler (Desired State -> Validated Commands)
+│   ├── compiler.py             # Deterministic Plan Compiler (Strict Schemas, Zero Generic Fallback)
+│   ├── safety_gate.py          # Live Mode Safety Gate (CLI Check, Allowlist Closure, Compilers)
 │   ├── resource_context.py     # Logical Resource Reference & Recursive Placeholder Engine
 │   ├── dependency_graph.py     # Directed Acyclic Graph & Topological Execution Sorter
 │   ├── rollback.py             # Reverse Topological Rollback Engine

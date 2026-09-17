@@ -16,7 +16,11 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
-from agent.compiler import PlanCompiler, UnsupportedResourceTypeError
+from agent.compiler import (
+    PlanCompiler,
+    UnsupportedConfigurationError,
+    UnsupportedResourceTypeError,
+)
 from agent.llm_client import LLMClient
 from agent.models import (
     ApprovalType,
@@ -134,6 +138,7 @@ class Planner:
         # Enrich and validate deterministically
         plan = self._enrich_plan(plan, region, profile)
         plan = self._validate_plan(plan)
+        plan.plan_hash = plan.compute_plan_fingerprint()
 
         logger.info(
             "Plan generated: %s | intent=%s | commands=%d | risk=%s | category=%s",
@@ -223,8 +228,8 @@ class Planner:
             )
             return plan
 
-        except UnsupportedResourceTypeError as ure:
-            logger.error("Unsupported resource type: %s", ure)
+        except (UnsupportedResourceTypeError, UnsupportedConfigurationError) as ure:
+            logger.error("Unsupported resource type or configuration: %s", ure)
             return self._create_error_plan(user_request, region, profile, str(ure))
         except Exception as e:
             logger.error("Error creating plan from parsed JSON: %s", e, exc_info=True)

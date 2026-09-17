@@ -9,9 +9,17 @@ must render without independent re-interpretation.
 from __future__ import annotations
 
 import logging
-from typing import Any
+from datetime import datetime, timezone
+from typing import Any, Optional
 
-from agent.models import ApprovalType, OperationCategory, ProvisioningPlan, RiskLevel
+from agent.models import (
+    ApprovalStatus,
+    ApprovalToken,
+    ApprovalType,
+    OperationCategory,
+    ProvisioningPlan,
+    RiskLevel,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -122,3 +130,71 @@ class ApprovalManager:
                 lines.append(f"- ⚠️ {warn}")
 
         return "\n".join(lines)
+
+    def create_approval_token(
+        self,
+        plan: ProvisioningPlan,
+        confirmation_token: Optional[str] = None,
+    ) -> ApprovalToken:
+        """Create an authoritative ApprovalToken bound to the plan's exact SHA-256 fingerprint.
+
+        Any subsequent alteration to the plan commands, parameters, or resources will invalidate this token.
+        """
+        requirement = self.determine_approval_requirement(plan)
+        approval_type: ApprovalType = requirement["approval_type"]
+        plan_hash = plan.plan_hash or plan.compute_plan_fingerprint()
+
+        return ApprovalToken(
+            plan_id=plan.plan_id,
+            plan_hash=plan_hash,
+            approval_type=approval_type,
+            approval_state=ApprovalStatus.APPROVED,
+            approved_at=datetime.now(timezone.utc),
+            confirmation_token=confirmation_token,
+        )
+
+    def validate_approval(
+        self,
+        plan: ProvisioningPlan,
+        token: Optional[ApprovalToken],
+        confirmation_token: Optional[str] = None,
+    ) -> tuple[bool, list[str]]:
+        """Validate whether the given approval token authoritatively authorizes execution.
+
+        Checks:
+        1. Token presence when approval is required
+        2. Binding to exact plan_id
+        3. Deterministic SHA-256 fingerprint matching plan's current state
+        4. Explicit confirmation token for destructive operations
+        """
+        issues: list[str] = []
+        requirement = self.determine_approval_requirement(plan)
+        req_type: ApprovalType = requirement["approval_type"]
+
+        if req_type == ApprovalType.AUTO:
+            return True, []
+
+        if not token:
+            issues.append(f"Plan requires {req_type.value} approval, but no approval token was provided.")
+            return False, issues
+
+        if token.plan_id != plan.plan_id:
+            issues.append(
+                f"Approval token is bound to plan '{token.plan_id}', but executing plan is '{plan.plan_id}'."
+            )
+
+        current_hash = plan.compute_plan_fingerprint()
+        if token.plan_hash != current_hash:
+            issues.append(
+                f"Approval token was generated for plan hash '{token.plan_hash[:8]}...', "
+                f"but plan content has mutated to '{current_hash[:8]}...'. Execution refused."
+            )
+
+        if req_type == ApprovalType.EXPLICIT_CONFIRMATION:
+            supplied_conf = token.confirmation_token or confirmation_token
+            if not supplied_conf or supplied_conf.strip().upper() not in ("CONFIRM DELETE", "CONFIRM ROLLBACK"):
+                issues.append(
+                    "Explicit confirmation required: must supply confirmation_token 'CONFIRM DELETE' or 'CONFIRM ROLLBACK'."
+                )
+
+        return len(issues) == 0, issues

@@ -6,7 +6,11 @@ DynamoDB, and validates error handling for unsupported resource types.
 """
 
 import pytest
-from agent.compiler import PlanCompiler, UnsupportedResourceTypeError
+from agent.compiler import (
+    PlanCompiler,
+    UnsupportedConfigurationError,
+    UnsupportedResourceTypeError,
+)
 from agent.models import (
     ApprovalType,
     DesiredResource,
@@ -365,3 +369,85 @@ class TestPlanCompiler:
         assert plan.destructive_operations is True
         assert plan.requires_approval is True
         assert plan.approval_type == ApprovalType.EXPLICIT_CONFIRMATION
+
+    def test_unknown_configuration_field_rejected(self):
+        """Test that unknown configuration fields raise UnsupportedConfigurationError before commands are built."""
+        desired = DesiredStatePlan(
+            intent="Create an S3 bucket with illegal flag",
+            operation_type=OperationType.CREATE,
+            resources=[
+                DesiredResource(
+                    logical_ref="s3.bucket",
+                    resource_type="bucket",
+                    service="s3",
+                    configuration={
+                        "bucket": "safe-bucket-name",
+                        "malicious_extra_field": "dangerous_payload",
+                    },
+                )
+            ],
+        )
+
+        with pytest.raises(UnsupportedConfigurationError) as exc_info:
+            self.compiler.compile(
+                desired=desired,
+                user_request="Create bucket with bad param",
+                region="ap-south-1",
+            )
+        assert "Unknown or unapproved configuration field" in str(exc_info.value)
+        assert "malicious_extra_field" in str(exc_info.value)
+
+    def test_unsupported_resource_type_fails_compilation(self):
+        """Test that an unknown resource type fails compilation completely."""
+        desired = DesiredStatePlan(
+            intent="Create an unsupported futuristic resource",
+            operation_type=OperationType.CREATE,
+            resources=[
+                DesiredResource(
+                    logical_ref="alien.saucer",
+                    resource_type="saucer",
+                    service="alien",
+                    configuration={"warp_speed": 9},
+                )
+            ],
+        )
+
+        with pytest.raises(UnsupportedResourceTypeError) as exc_info:
+            self.compiler.compile(
+                desired=desired,
+                user_request="Create alien saucer",
+                region="ap-south-1",
+            )
+        assert "Unsupported resource type 'saucer'" in str(exc_info.value)
+
+    def test_plan_fingerprint_generated_and_deterministic(self):
+        """Test that compiler generates plan_hash and it is deterministic for identical plans."""
+        desired = DesiredStatePlan(
+            intent="Create a VPC",
+            operation_type=OperationType.CREATE,
+            resources=[
+                DesiredResource(
+                    logical_ref="vpc.main",
+                    resource_type="vpc",
+                    service="vpc",
+                    resource_name="my-vpc",
+                    configuration={"cidr_block": "10.0.0.0/16"},
+                )
+            ],
+        )
+
+        plan1 = self.compiler.compile(
+            desired=desired,
+            user_request="Create VPC 10.0.0.0/16",
+            region="ap-south-1",
+            profile="default",
+        )
+        assert plan1.plan_hash is not None
+        assert len(plan1.plan_hash) == 64
+
+        # Manually verify hash matches recomputed fingerprint
+        assert plan1.plan_hash == plan1.compute_plan_fingerprint()
+
+        # Mutate plan command parameter -> hash changes
+        plan1.commands[0].parameters["cidr-block"] = "192.168.0.0/16"
+        assert plan1.plan_hash != plan1.compute_plan_fingerprint()

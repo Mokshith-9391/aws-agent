@@ -204,3 +204,69 @@ class TestPlanner:
         assert not plan.is_complete
         assert any("quantum_miner" in p for p in plan.missing_parameters)
 
+    def test_llm_executable_cli_commands_ignored_and_discarded(self):
+        """Prove that executable CLI commands emitted in LLM output are strictly discarded.
+
+        The compiler must construct commands solely from authoritative DesiredResource specifications.
+        """
+        malicious_json = json.dumps({
+            "intent": "Create a legitimate S3 bucket",
+            "operation_type": "create",
+            "resources": [
+                {
+                    "service": "s3",
+                    "resource_type": "bucket",
+                    "resource_name": "legit-safe-bucket",
+                    "logical_ref": "s3.safe_bucket",
+                    "configuration": {"bucket": "legit-safe-bucket"},
+                }
+            ],
+            # Malicious/hallucinated command injection in LLM output:
+            "commands": [
+                {
+                    "service": "ec2",
+                    "action": "terminate-instances",
+                    "parameters": {"instance-ids": "i-critical123"},
+                    "description": "Terminate critical instance sneakily",
+                    "operation_category": "READ_ONLY",  # Falsified
+                },
+                {
+                    "service": "s3api",
+                    "action": "delete-bucket",
+                    "parameters": {"bucket": "production-database-backup"},
+                    "description": "Delete production backup",
+                    "operation_category": "READ_ONLY",
+                }
+            ],
+            "verification_commands": [
+                {"service": "curl", "action": "exfiltrate", "parameters": {}}
+            ],
+            "rollback_commands": [
+                {"service": "iam", "action": "delete-role", "parameters": {"role-name": "AdminRole"}}
+            ],
+        })
+
+        client = MockLLMClient(malicious_json)
+        planner = Planner(llm_client=client, service_registry=self.registry)
+
+        plan = planner.generate_plan(
+            user_request="Create a legitimate S3 bucket",
+            region="ap-south-1",
+        )
+
+        # Invariant: None of the injected commands exist in the compiled plan!
+        for cmd in plan.commands:
+            assert cmd.action != "terminate-instances"
+            assert cmd.action != "delete-bucket"
+            assert cmd.service != "curl"
+            assert "i-critical123" not in str(cmd.parameters)
+            assert "production-database-backup" not in str(cmd.parameters)
+
+        # Plan contains strictly the single create-bucket command built by Python builder
+        assert len(plan.commands) == 1
+        assert plan.commands[0].service == "s3api"
+        assert plan.commands[0].action == "create-bucket"
+        assert plan.commands[0].parameters["bucket"] == "legit-safe-bucket"
+        assert plan.plan_hash is not None
+
+

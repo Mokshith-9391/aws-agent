@@ -5,7 +5,9 @@ import pytest
 from agent.llm_client import LLMClient
 from agent.models import (
     AgentResponse,
+    ApprovalToken,
     ApprovalType,
+    CLICommand,
     CommandExecutionStatus,
     CommandResult,
     ExecutionStatus,
@@ -474,4 +476,155 @@ class TestEndToEndScenario:
         res = exec_resp.execution_result
         assert res.status == ExecutionStatus.ROLLED_BACK
         assert any("rolled back" in w.lower() for w in exec_resp.warnings)
+
+    def test_scenario_l_tampered_plan_fingerprint_mismatch_blocks_execution(self):
+        """Scenario L: Fingerprint mismatch re-validation blocks execution if plan was mutated after approval."""
+        plan_resp = self.orchestrator.process_request(
+            user_request="Create an S3 bucket named my-prod-data-backup-bucket",
+            region="ap-south-1",
+            dry_run=True,
+        )
+        plan = plan_resp.plan
+        assert plan.plan_hash is not None
+
+        # Simulate tampering with a command parameter after approval
+        plan.commands[0].parameters["bucket"] = "injected-malicious-target"
+
+        mock_exec = MagicMock()
+        self.orchestrator._executor = mock_exec
+
+        exec_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+        )
+
+        assert exec_resp.execution_result is None
+        assert "Fingerprint Mismatch" in exec_resp.message
+        assert any("tampered" in w or "altered" in w for w in exec_resp.warnings)
+        # Verify executor was NEVER called
+        assert mock_exec.execute_command.call_count == 0
+
+    def test_scenario_m_approval_token_validation(self):
+        """Scenario M: ApprovalToken authoritatively authorizes execution and detects tampering."""
+        plan_resp = self.orchestrator.process_request(
+            user_request="Create an S3 bucket named my-prod-data-backup-bucket",
+            region="ap-south-1",
+            dry_run=True,
+        )
+        plan = plan_resp.plan
+
+        # Generate authoritative approval token bound to plan fingerprint
+        token = self.orchestrator._approval_manager.create_approval_token(plan)
+        assert token.plan_id == plan.plan_id
+        assert token.plan_hash == plan.plan_hash
+
+        mock_exec = MagicMock()
+        mock_exec.execute_command.return_value = CommandResult(
+            command_id="cmd-1", stdout="{}", parsed_output={}, stderr="", exit_code=0, success=True
+        )
+        self.orchestrator._executor = mock_exec
+
+        # Execute with valid token -> SUCCESS
+        valid_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+            approval_token=token,
+        )
+        assert valid_resp.execution_result.status == ExecutionStatus.SUCCESS
+
+        # Invalidate token by tampering with plan
+        plan.commands[0].parameters["bucket"] = "tampered"
+        tampered_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+            approval_token=token,
+        )
+        assert tampered_resp.execution_result is None
+        assert "Fingerprint Mismatch" in tampered_resp.message
+
+    def test_scenario_n_default_failure_mode_rollback_pending(self):
+        """Scenario N: Default failure mode enters ROLLBACK_PENDING with candidates; requires explicit CONFIRM ROLLBACK."""
+        prompt = "Create a custom vpc with public subnet and web server in Mumbai"
+        plan_resp = self.orchestrator.process_request(
+            user_request=prompt,
+            region="ap-south-1",
+            dry_run=True,
+        )
+        plan = plan_resp.plan
+
+        mock_exec = MagicMock()
+        def fake_exec(cmd, **kwargs):
+            if cmd.action == "create-vpc":
+                return CommandResult(command_id=cmd.command_id, stdout='{"Vpc": {"VpcId": "vpc-pending-1"}}', parsed_output={"Vpc": {"VpcId": "vpc-pending-1"}}, resource_ids={"VpcId": "vpc-pending-1"}, stderr="", exit_code=0, success=True)
+            elif cmd.action == "create-subnet":
+                return CommandResult(command_id=cmd.command_id, stdout="", stderr="Subnet failure", exit_code=1, success=False, error_message="Subnet failure")
+            elif cmd.action == "delete-vpc":
+                return CommandResult(command_id=cmd.command_id, stdout="{}", parsed_output={}, stderr="", exit_code=0, success=True)
+            return CommandResult(command_id=cmd.command_id, stdout="{}", parsed_output={}, stderr="", exit_code=0, success=True)
+
+        mock_exec.execute_command.side_effect = fake_exec
+        self.orchestrator._executor = mock_exec
+
+        # Execute with default settings (auto_rollback defaults to False)
+        exec_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+        )
+        res = exec_resp.execution_result
+        assert res.status == ExecutionStatus.ROLLBACK_PENDING
+        assert len(res.rollback_candidates) > 0
+        assert any("delete-vpc" in c for c in res.rollback_candidates)
+
+        # Rollback without explicit token is rejected
+        unauth_rb = self.orchestrator.execute_rollback_for_plan(
+            plan=plan,
+            execution_result=res,
+            region="ap-south-1",
+            profile="default",
+            confirmation_token=None,
+        )
+        assert "Rollback authorization failed" in unauth_rb.message
+
+        # Rollback with explicit CONFIRM ROLLBACK succeeds
+        auth_rb = self.orchestrator.execute_rollback_for_plan(
+            plan=plan,
+            execution_result=res,
+            region="ap-south-1",
+            profile="default",
+            confirmation_token="CONFIRM ROLLBACK",
+        )
+        assert auth_rb.execution_result.status == ExecutionStatus.ROLLED_BACK
+
+    def test_scenario_o_live_mode_safety_gate_blocks_when_cli_missing(self):
+        """Scenario O: Live Mode Safety Gate blocks live execution when AWS CLI is missing or unverified."""
+        from aws.cli_executor import AWSCLIExecutor
+
+        plan_resp = self.orchestrator.process_request(
+            user_request="Create an S3 bucket named my-prod-data-backup-bucket",
+            region="ap-south-1",
+            dry_run=True,
+        )
+        plan = plan_resp.plan
+
+        # Mock identity manager to simulate missing AWS CLI on host
+        mock_id = MagicMock()
+        mock_id.check_cli_installed.return_value = (False, "AWS CLI not found in PATH")
+        real_type_executor = AWSCLIExecutor()
+        self.orchestrator._executor = real_type_executor
+        self.orchestrator._identity_manager = mock_id
+        self.orchestrator._safety_gate._executor = real_type_executor
+        self.orchestrator._safety_gate._identity_manager = mock_id
+
+        blocked_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+        )
+        assert blocked_resp.execution_result is None
+        assert "Execution Blocked by Live Mode Safety Gate" in blocked_resp.message
+        assert any("AWS CLI is not installed" in w for w in blocked_resp.warnings)
 

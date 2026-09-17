@@ -62,6 +62,7 @@ class Settings(BaseSettings):
     COMMAND_TIMEOUT: int = 300  # seconds per command
     REQUIRE_APPROVAL_WRITE: bool = True
     REQUIRE_APPROVAL_DESTRUCTIVE: bool = True
+    AUTO_ROLLBACK_ON_FAILURE: bool = False  # Disabled by default: mid-flight failure enters ROLLBACK_PENDING
 
     # --- Naming ---
     RESOURCE_NAME_PREFIX: str = "ai-agent"

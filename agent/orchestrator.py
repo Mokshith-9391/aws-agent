@@ -22,6 +22,7 @@ from agent.llm_client import LLMClient, create_llm_client
 from agent.models import (
     AgentResponse,
     ApprovalStatus,
+    ApprovalToken,
     ApprovalType,
     CLICommand,
     CommandExecutionStatus,
@@ -43,6 +44,7 @@ from agent.parser import RequestParser
 from agent.planner import Planner
 from agent.resource_context import ResourceContext, UnresolvedReferenceError
 from agent.rollback import RollbackEngine
+from agent.safety_gate import LiveModeSafetyGate
 from aws.cli_executor import AWSCLIExecutor
 from aws.cli_validator import CLICommandValidator
 from aws.identity import AWSIdentityManager
@@ -82,6 +84,7 @@ class AgentOrchestrator:
         self._history_store = ExecutionStore()
         self._rollback_engine = RollbackEngine(self._executor)
         self._registry: AWSServiceRegistry = create_default_registry()
+        self._safety_gate = LiveModeSafetyGate(self._identity_manager, self._registry, executor=self._executor)
 
         # Session state
         self._conversation_history: list[dict] = []
@@ -142,12 +145,29 @@ class AgentOrchestrator:
 
         logger.info("Processing request: '%s' (profile=%s, region=%s, dry_run=%s)", user_request[:80], profile, region, dry_run)
 
+        # ── Step 0: Live Mode Safety Gate ────────────────────────────
+        safety_gate_warnings: list[str] = []
+        if not dry_run:
+            self._safety_gate._executor = self._executor
+            self._safety_gate._identity_manager = self._identity_manager
+            gate_report = self._safety_gate.check_readiness(
+                profile=profile,
+                region=region,
+                check_credentials=True,
+            )
+            if not gate_report.is_live_ready:
+                logger.warning("Live Mode pre-flight check warnings: %s", gate_report.issues)
+                safety_gate_warnings = [
+                    f"⚠️ Live Mode Safety Warning: {issue}"
+                    for issue in gate_report.issues
+                ]
+
         # ── Step 1: Input Validation & Prompt Injection Defense ──────
         is_valid, issues = self._parser.validate_input(user_request)
         if not is_valid:
             return AgentResponse(
                 message="❌ " + "\n".join(issues),
-                warnings=issues,
+                warnings=safety_gate_warnings + issues,
             )
 
         sanitized_input = self._parser.sanitize_for_llm(user_request)
@@ -221,6 +241,7 @@ class AgentOrchestrator:
         approval_info = self._approval_manager.determine_approval_requirement(plan)
         plan.approval_type = approval_info["approval_type"]
         plan.requires_approval = approval_info["requires_approval"]
+        plan.plan_hash = plan.compute_plan_fingerprint()
 
         # ── Step 8: Educational Content (if requested) ────────────────
         educational_content = None
@@ -256,7 +277,7 @@ class AgentOrchestrator:
                 requires_approval=False,
                 approval_type=plan.approval_type,
                 educational_content=educational_content,
-                warnings=policy_warnings + plan.cost_warnings,
+                warnings=safety_gate_warnings + policy_warnings + plan.cost_warnings,
             )
 
         # ── Step 10: Human Approval Required ─────────────────────────
@@ -268,7 +289,7 @@ class AgentOrchestrator:
                 requires_approval=True,
                 approval_type=plan.approval_type,
                 educational_content=educational_content,
-                warnings=policy_warnings + plan.cost_warnings,
+                warnings=safety_gate_warnings + policy_warnings + plan.cost_warnings,
             )
 
         # ── Step 11: Auto-Approved (READ_ONLY) -> Execute ─────────────
@@ -312,7 +333,8 @@ class AgentOrchestrator:
         profile: str = "default",
         learning_mode: bool = False,
         confirmation_token: Optional[str] = None,
-        auto_rollback: bool = False,
+        auto_rollback: Optional[bool] = None,
+        approval_token: Optional[ApprovalToken] = None,
     ) -> AgentResponse:
         """Execute an approved provisioning plan using the effective profile and region.
 
@@ -322,17 +344,69 @@ class AgentOrchestrator:
         """
         logger.info("Executing approved plan: %s (profile=%s, region=%s)", plan.plan_id, profile, region)
 
-        # ── Step 0: Backend Approval Re-validation ───────────────────
-        approval_req = self._approval_manager.determine_approval_requirement(plan)
-        if approval_req.get("approval_type") == ApprovalType.EXPLICIT_CONFIRMATION or plan.approval_type == ApprovalType.EXPLICIT_CONFIRMATION:
-            if not confirmation_token or confirmation_token.strip().upper() != "CONFIRM DELETE":
-                logger.warning("Plan %s blocked: explicit confirmation token 'CONFIRM DELETE' missing or incorrect", plan.plan_id)
+        if auto_rollback is None:
+            auto_rollback = self._settings.AUTO_ROLLBACK_ON_FAILURE
+
+        self._verifier.executor = self._executor
+        self._rollback_engine.executor = self._executor
+        self._discovery.executor = self._executor
+
+        # ── Step 0: Plan Fingerprint Re-validation (Tamper Detection) ───
+        current_hash = plan.compute_plan_fingerprint()
+        if plan.plan_hash and plan.plan_hash != current_hash:
+            logger.error(
+                "Plan %s fingerprint mismatch: compiled=%s, current=%s",
+                plan.plan_id,
+                plan.plan_hash,
+                current_hash,
+            )
+            return AgentResponse(
+                message="❌ **Execution Blocked: Plan Fingerprint Mismatch**\nThe plan commands, flags, parameters, or target resources have been modified after compilation/approval. Execution is refused for safety.",
+                plan=plan,
+                warnings=["Plan fingerprint mismatch: plan has been altered after approval."],
+            )
+
+        # ── Step 0b: Approval Token & Confirmation Validation ─────────
+        if approval_token:
+            token_valid, token_issues = self._approval_manager.validate_approval(
+                plan=plan,
+                token=approval_token,
+                confirmation_token=confirmation_token,
+            )
+            if not token_valid:
+                logger.error("Plan %s blocked by invalid approval token: %s", plan.plan_id, token_issues)
                 return AgentResponse(
-                    message="❌ **Execution Blocked**: This operation involves destructive actions and requires explicit confirmation. Please provide confirmation token 'CONFIRM DELETE'.",
+                    message="❌ **Execution Blocked: Invalid Approval Token**\n" + "\n".join(f"- 🛑 {iss}" for iss in token_issues),
                     plan=plan,
-                    approval_type=ApprovalType.EXPLICIT_CONFIRMATION,
-                    warnings=["Explicit confirmation token 'CONFIRM DELETE' required."],
+                    warnings=token_issues,
                 )
+        else:
+            approval_req = self._approval_manager.determine_approval_requirement(plan)
+            if approval_req.get("approval_type") == ApprovalType.EXPLICIT_CONFIRMATION or plan.approval_type == ApprovalType.EXPLICIT_CONFIRMATION:
+                if not confirmation_token or confirmation_token.strip().upper() != "CONFIRM DELETE":
+                    logger.warning("Plan %s blocked: explicit confirmation token 'CONFIRM DELETE' missing or incorrect", plan.plan_id)
+                    return AgentResponse(
+                        message="❌ **Execution Blocked**: This operation involves destructive actions and requires explicit confirmation. Please provide confirmation token 'CONFIRM DELETE'.",
+                        plan=plan,
+                        approval_type=ApprovalType.EXPLICIT_CONFIRMATION,
+                        warnings=["Explicit confirmation token 'CONFIRM DELETE' required."],
+                    )
+
+        # ── Step 0c: Live Mode Safety Gate Pre-Check ──────────────────
+        self._safety_gate._executor = self._executor
+        self._safety_gate._identity_manager = self._identity_manager
+        gate_report = self._safety_gate.check_readiness(
+            profile=profile,
+            region=region,
+            check_credentials=False,
+        )
+        if not gate_report.is_live_ready:
+            logger.error("Plan %s execution blocked by Live Mode Safety Gate: %s", plan.plan_id, gate_report.issues)
+            return AgentResponse(
+                message="🚫 **Execution Blocked by Live Mode Safety Gate:**\n" + "\n".join(f"- 🛑 {i}" for i in gate_report.issues),
+                plan=plan,
+                warnings=gate_report.issues,
+            )
 
         # Re-check policy safety before execution
         is_safe, _, blocking = self._policy_engine.evaluate_plan(plan)
@@ -500,19 +574,31 @@ class AgentOrchestrator:
                     context=self._resource_context,
                 )
                 if rb_commands:
-                    rb_results = self._rollback_engine.execute_rollback(
+                    rb_output = self._rollback_engine.execute_rollback(
                         rollback_commands=rb_commands,
                         region=region,
                         profile=profile,
                         resource_context=self._resource_context,
                     )
-                    all_rb_ok = all(r.success for r in rb_results)
+                    if isinstance(rb_output, tuple):
+                        all_rb_ok, rb_results = rb_output
+                    else:
+                        rb_results = rb_output
+                        all_rb_ok = all(r.success for r in rb_results)
                     execution_result.status = ExecutionStatus.ROLLED_BACK if all_rb_ok else ExecutionStatus.ROLLBACK_FAILED
                 else:
                     execution_result.status = ExecutionStatus.ROLLED_BACK
             elif created_resources:
                 logger.info("Plan %s encountered partial failure. Created resources present, setting status to ROLLBACK_PENDING.", plan.plan_id)
                 execution_result.status = ExecutionStatus.ROLLBACK_PENDING
+                rb_commands = self._rollback_engine.generate_rollback_commands(
+                    plan=plan,
+                    execution_result=execution_result,
+                    context=self._resource_context,
+                )
+                execution_result.rollback_candidates = [
+                    cmd.to_display_string(profile=profile, region=region) for cmd in rb_commands
+                ]
             else:
                 execution_result.status = ExecutionStatus.FAILED
         elif execution_result.successful_commands > 0 and execution_result.failed_commands == 0:
@@ -590,13 +676,17 @@ class AgentOrchestrator:
         )
         rb_results = []
         if rb_commands:
-            rb_results = self._rollback_engine.execute_rollback(
+            rb_output = self._rollback_engine.execute_rollback(
                 rollback_commands=rb_commands,
                 region=region,
                 profile=profile,
                 resource_context=self._resource_context,
             )
-            all_rb_ok = all(r.success for r in rb_results)
+            if isinstance(rb_output, tuple):
+                all_rb_ok, rb_results = rb_output
+            else:
+                rb_results = rb_output
+                all_rb_ok = all(r.success for r in rb_results)
             execution_result.status = ExecutionStatus.ROLLED_BACK if all_rb_ok else ExecutionStatus.ROLLBACK_FAILED
         else:
             execution_result.status = ExecutionStatus.ROLLED_BACK

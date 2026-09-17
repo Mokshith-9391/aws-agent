@@ -343,6 +343,52 @@ class ProvisioningPlan(BaseModel):
     # --- Educational ---
     educational_notes: list[str] = Field(default_factory=list, description="Educational notes about the operation")
 
+    # --- Plan Fingerprint & Tamper Detection ---
+    plan_hash: Optional[str] = Field(None, description="Deterministic SHA-256 fingerprint of the compiled plan")
+
+    def compute_plan_fingerprint(self) -> str:
+        """Compute a deterministic SHA-256 fingerprint of this plan.
+
+        Binds to plan_id, operation type & category, region, profile,
+        canonical command specifications, and logical resource metadata.
+        Any mutation to commands, flags, parameters, or targets changes the hash.
+        """
+        import hashlib
+        import json
+
+        canonical_commands = []
+        for cmd in self.commands:
+            canonical_commands.append({
+                "command_id": cmd.command_id,
+                "service": cmd.service,
+                "action": cmd.action,
+                "parameters": {k: str(v) for k, v in sorted(cmd.parameters.items())},
+                "resource_ref": cmd.resource_ref or "",
+                "depends_on": sorted(cmd.depends_on),
+                "operation_category": cmd.operation_category.value,
+            })
+
+        canonical_resources = []
+        for lr in self.logical_resources:
+            canonical_resources.append({
+                "resource_ref": lr.resource_ref,
+                "domain_service": lr.domain_service or lr.service,
+                "resource_type": lr.resource_type,
+                "ownership": lr.ownership.value,
+            })
+
+        payload = {
+            "plan_id": self.plan_id,
+            "operation_type": self.operation_type.value,
+            "operation_category": self.operation_category.value,
+            "aws_region": self.aws_region,
+            "aws_profile": self.aws_profile,
+            "commands": canonical_commands,
+            "logical_resources": canonical_resources,
+        }
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
     @property
     def is_complete(self) -> bool:
         """Check if the plan has all required information."""
@@ -355,6 +401,17 @@ class ProvisioningPlan(BaseModel):
             cmd.operation_category == OperationCategory.DESTRUCTIVE
             for cmd in self.commands
         )
+
+
+class ApprovalToken(BaseModel):
+    """Authoritative approval token binding user confirmation to an exact plan fingerprint."""
+    token_id: str = Field(default_factory=lambda: f"tok-{uuid.uuid4().hex[:12]}")
+    plan_id: str = Field(..., description="Plan ID this approval token applies to")
+    plan_hash: str = Field(..., description="SHA-256 plan fingerprint at approval time")
+    approval_type: ApprovalType = Field(..., description="Approval requirement level")
+    approval_state: ApprovalStatus = Field(ApprovalStatus.APPROVED, description="Approval status")
+    approved_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    confirmation_token: Optional[str] = Field(None, description="Explicit confirmation token for destructive operations")
 
 
 # ──────────────────────────────────────────────
@@ -415,6 +472,10 @@ class ExecutionResult(BaseModel):
     )
     failed_resources: list[str] = Field(default_factory=list, description="Resources that failed to create")
     skipped_commands: list[str] = Field(default_factory=list, description="Commands skipped due to failed dependencies")
+    rollback_candidates: list[str] = Field(
+        default_factory=list,
+        description="Candidate command strings for rollback when execution is in ROLLBACK_PENDING state"
+    )
 
     # --- Metadata ---
     total_commands: int = 0
