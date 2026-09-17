@@ -16,10 +16,13 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from agent.compiler import PlanCompiler, UnsupportedResourceTypeError
 from agent.llm_client import LLMClient
 from agent.models import (
     ApprovalType,
     CLICommand,
+    DesiredResource,
+    DesiredStatePlan,
     ExecutionStatus,
     LogicalResource,
     OperationCategory,
@@ -54,6 +57,7 @@ class Planner:
         self._llm = llm_client
         self._registry = service_registry
         self._ami_discovery = AMIDiscovery()
+        self._compiler = PlanCompiler(self._registry, self._ami_discovery)
 
     def generate_plan(
         self,
@@ -167,148 +171,80 @@ class Planner:
             except ValueError:
                 operation_type = OperationType.CREATE
 
-            # Parse resources
-            resources = []
-            logical_resources = []
+            # Parse desired resources from LLM output (desired-state intent)
+            desired_resources: list[DesiredResource] = []
             for r in data.get("resources", []):
-                svc = r.get("service", "")
+                svc = r.get("service")
                 rtype = r.get("resource_type", "")
                 rname = r.get("resource_name")
-                ref = r.get("logical_ref") or f"{svc}.{rtype}"
-                resources.append(ResourceConfig(
-                    service=svc,
-                    resource_type=rtype,
-                    resource_name=rname,
-                    configuration=r.get("configuration", {}),
-                    dependencies=r.get("dependencies", []),
-                    tags=r.get("tags", {}),
-                    logical_ref=ref,
-                ))
-                logical_resources.append(LogicalResource(
-                    resource_ref=ref,
-                    resource_type=rtype,
-                    service=svc,
-                    resource_name=rname,
-                    ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
-                ))
-
-            # Parse commands with AUTHORITATIVE deterministic category classification
-            commands: list[CLICommand] = []
-            for c in data.get("commands", []):
-                svc = c.get("service", "")
-                act = c.get("action", "")
-                # Critical Fix #2: Deterministic category mapping based on service & action
-                authoritative_cat = classify_aws_action(svc, act)
-
-                cmd = CLICommand(
-                    command_id=c.get("command_id", str(uuid.uuid4())[:8]),
-                    service=svc,
-                    action=act,
-                    parameters=c.get("parameters", {}),
-                    region=c.get("region", region),
-                    profile=profile,
-                    description=c.get("description", ""),
-                    operation_category=authoritative_cat,
-                    resource_ref=c.get("resource_ref"),
-                    depends_on=c.get("depends_on", []),
-                    output_key=c.get("output_key"),
+                ref = r.get("logical_ref") or f"{svc or 'res'}.{rtype}"
+                cfg = r.get("configuration", {})
+                deps = r.get("dependencies", [])
+                tags = r.get("tags", {})
+                desired_resources.append(
+                    DesiredResource(
+                        logical_ref=ref,
+                        resource_type=rtype,
+                        service=svc,
+                        resource_name=rname,
+                        configuration=cfg,
+                        dependencies=deps,
+                        tags=tags,
+                    )
                 )
-                commands.append(cmd)
 
-            # Determine plan-level operation category deterministically
-            if any(cmd.operation_category == OperationCategory.DESTRUCTIVE for cmd in commands):
-                overall_category = OperationCategory.DESTRUCTIVE
-            elif any(cmd.operation_category == OperationCategory.WRITE for cmd in commands):
-                overall_category = OperationCategory.WRITE
-            else:
-                overall_category = OperationCategory.READ_ONLY
+            # Fallback for read-only queries if LLM emitted no explicit resources
+            if not desired_resources:
+                req_lower = user_request.lower()
+                if operation_type in (OperationType.LIST, OperationType.DESCRIBE) or any(w in req_lower for w in ("list", "show", "describe", "find", "get")):
+                    if any(w in req_lower for w in ("instance", "ec2", "vm")):
+                        desired_resources.append(DesiredResource(logical_ref="ec2.instance", resource_type="instance", service="ec2"))
+                    elif any(w in req_lower for w in ("bucket", "s3")):
+                        desired_resources.append(DesiredResource(logical_ref="s3.bucket", resource_type="bucket", service="s3"))
+                    elif "vpc" in req_lower:
+                        desired_resources.append(DesiredResource(logical_ref="vpc.main", resource_type="vpc", service="vpc"))
 
-            # Parse verification commands
-            verification_steps: list[CLICommand] = []
-            for v in data.get("verification_commands", []):
-                ver_cmd = CLICommand(
-                    command_id=f"verify-{uuid.uuid4().hex[:6]}",
-                    service=v.get("service", ""),
-                    action=v.get("action", ""),
-                    parameters=v.get("parameters", {}),
-                    region=region,
-                    profile=profile,
-                    description=v.get("description", "Verify resource state"),
-                    operation_category=OperationCategory.READ_ONLY,
-                )
-                verification_steps.append(ver_cmd)
-
-            # Parse rollback commands
-            rollback_strategy: list[RollbackStep] = []
-            for i, rb in enumerate(data.get("rollback_commands", [])):
-                rb_cmd = CLICommand(
-                    command_id=f"rollback-{uuid.uuid4().hex[:6]}",
-                    service=rb.get("service", ""),
-                    action=rb.get("action", ""),
-                    parameters=rb.get("parameters", {}),
-                    region=region,
-                    profile=profile,
-                    description=rb.get("description", "Rollback operation"),
-                    operation_category=OperationCategory.DESTRUCTIVE,
-                )
-                rollback_strategy.append(RollbackStep(
-                    order=i + 1,
-                    resource_description=rb.get("resource_description", rb.get("description", "")),
-                    command=rb_cmd,
-                ))
-
-            # Parse risk level
-            risk_str = data.get("risk_level", "MEDIUM").upper()
-            try:
-                risk_level = RiskLevel(risk_str)
-            except ValueError:
-                risk_level = RiskLevel.MEDIUM
-
-            # If destructive, elevate risk to HIGH minimum
-            if overall_category == OperationCategory.DESTRUCTIVE and risk_level == RiskLevel.LOW:
-                risk_level = RiskLevel.HIGH
-
-            return ProvisioningPlan(
-                user_request=user_request,
+            desired_plan = DesiredStatePlan(
                 intent=data.get("intent", user_request),
                 operation_type=operation_type,
-                operation_category=overall_category,
-                aws_profile=profile,
                 aws_region=region,
-                aws_account_id=account_id,
-                resources=resources,
-                logical_resources=logical_resources,
-                dependencies=data.get("dependencies", []),
-                commands=commands,
-                risk_level=risk_level,
-                destructive_operations=(overall_category == OperationCategory.DESTRUCTIVE),
+                resources=desired_resources,
                 missing_parameters=data.get("missing_parameters", []),
                 assumptions=data.get("assumptions", []),
-                requires_approval=(overall_category != OperationCategory.READ_ONLY),
-                rollback_strategy=rollback_strategy,
-                verification_steps=verification_steps,
-                cost_warnings=data.get("cost_warnings", []),
-                educational_notes=data.get("educational_notes", []),
             )
 
+            # Compile into authoritative ProvisioningPlan using deterministic Python builders
+            plan = self._compiler.compile(
+                desired=desired_plan,
+                user_request=user_request,
+                region=region,
+                profile=profile,
+                account_id=account_id,
+            )
+            return plan
+
+        except UnsupportedResourceTypeError as ure:
+            logger.error("Unsupported resource type: %s", ure)
+            return self._create_error_plan(user_request, region, profile, str(ure))
         except Exception as e:
             logger.error("Error creating plan from parsed JSON: %s", e, exc_info=True)
             return self._create_error_plan(user_request, region, profile, f"Plan creation error: {e}")
 
     def _enrich_plan(self, plan: ProvisioningPlan, region: str, profile: str) -> ProvisioningPlan:
         """Deterministically enrich the plan: resolve AMIs, cost warnings, and tags."""
-        # 1. Deterministic AMI Discovery for EC2 instances
+        # 1. Deterministic Live AMI Discovery for EC2 instances
         for cmd in plan.commands:
             if cmd.service == "ec2" and cmd.action == "run-instances":
                 curr_ami = cmd.parameters.get("image-id")
                 # If AMI is missing, or looks like a placeholder, or user requested Amazon Linux
                 if not curr_ami or "ami-" not in curr_ami or "placeholder" in curr_ami.lower() or "012345" in curr_ami:
                     discovered_ami, rationale = self._ami_discovery.discover_amazon_linux_2023(
-                        region=region, profile=profile, query_live=False
+                        region=region, profile=profile, query_live=True
                     )
                     if discovered_ami:
                         cmd.parameters["image-id"] = discovered_ami
-                        plan.assumptions.append(rationale)
+                        if rationale not in plan.assumptions:
+                            plan.assumptions.append(rationale)
 
         # 2. Enrich Cost Warnings from Service Registry
         for res in plan.resources:
@@ -327,6 +263,12 @@ class Planner:
 
     def _validate_plan(self, plan: ProvisioningPlan) -> ProvisioningPlan:
         """Validate logical completeness and assign missing parameters."""
+        # Read-only and delete operations do not require resource creation parameters
+        if plan.operation_type in (OperationType.LIST, OperationType.DESCRIBE, OperationType.READ) or plan.operation_category == OperationCategory.READ_ONLY:
+            return plan
+        if plan.operation_type == OperationType.DELETE or plan.operation_category == OperationCategory.DESTRUCTIVE:
+            return plan
+
         for res in plan.resources:
             rt_def = self._registry.get_resource_type(res.service, res.resource_type)
             if not rt_def:

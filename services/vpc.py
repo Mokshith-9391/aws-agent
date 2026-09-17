@@ -302,6 +302,91 @@ def build_ingress_command(
     )
 
 
+def build_delete_vpc_command(
+    vpc_id: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-vpc command."""
+    return CLICommand(
+        command_id=command_id or "cmd-vpc-delete",
+        service="ec2",
+        action="delete-vpc",
+        parameters={"vpc-id": vpc_id},
+        description=f"Delete VPC {vpc_id}",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_delete_subnet_command(
+    subnet_id: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-subnet command."""
+    return CLICommand(
+        command_id=command_id or "cmd-subnet-delete",
+        service="ec2",
+        action="delete-subnet",
+        parameters={"subnet-id": subnet_id},
+        description=f"Delete Subnet {subnet_id}",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_delete_security_group_command(
+    group_id: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-security-group command."""
+    return CLICommand(
+        command_id=command_id or "cmd-sg-delete",
+        service="ec2",
+        action="delete-security-group",
+        parameters={"group-id": group_id},
+        description=f"Delete Security Group {group_id}",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_delete_igw_command(
+    igw_id: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-internet-gateway command."""
+    return CLICommand(
+        command_id=command_id or "cmd-igw-delete",
+        service="ec2",
+        action="delete-internet-gateway",
+        parameters={"internet-gateway-id": igw_id},
+        description=f"Delete Internet Gateway {igw_id}",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_delete_route_table_command(
+    route_table_id: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-route-table command."""
+    return CLICommand(
+        command_id=command_id or "cmd-rt-delete",
+        service="ec2",
+        action="delete-route-table",
+        parameters={"route-table-id": route_table_id},
+        description=f"Delete Route Table {route_table_id}",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
 # ──────────────────────────────────────────────
 # Resource Type Definitions
 # ──────────────────────────────────────────────
@@ -421,8 +506,8 @@ def create_security_group_resource_def() -> ResourceTypeDefinition:
         describe_action="describe-security-groups",
         delete_action="delete-security-group",
         list_action="describe-security-groups",
-        required_params=["group-name", "description", "vpc-id"],
-        optional_params=["tag-specifications"],
+        required_params=["group-name", "description"],
+        optional_params=["vpc-id", "tag-specifications"],
         id_field="GroupId",
         name_tag_key="Name",
         supports_tags=True,

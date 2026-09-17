@@ -22,13 +22,6 @@ from config.settings import get_settings
 
 logger = logging.getLogger(__name__)
 
-# Only these AWS CLI service prefixes are allowed to execute
-ALLOWED_SERVICES = {
-    "ec2", "s3", "s3api", "iam", "lambda", "dynamodb", "cloudwatch",
-    "logs", "rds", "ecs", "sts", "elbv2", "elb", "route53", "sns",
-    "sqs", "cloudformation",
-}
-
 # Allowed actions per service (comprehensive CRUD)
 ALLOWED_ACTIONS: dict[str, set[str]] = {
     "ec2": {
@@ -116,6 +109,9 @@ ALLOWED_ACTIONS: dict[str, set[str]] = {
         "send-message", "receive-message", "get-queue-attributes",
     },
 }
+
+# Only services with explicit, non-empty action sets in ALLOWED_ACTIONS can execute
+ALLOWED_SERVICES: set[str] = set(ALLOWED_ACTIONS.keys())
 
 # Patterns to redact from log output
 SECRET_REDACTION_PATTERNS = [
@@ -210,7 +206,7 @@ class AWSCLIExecutor:
         execution_id = str(uuid.uuid4())[:8]
 
         # ── 1. Security Check: Service Allowlist ───────────
-        if cmd.service not in ALLOWED_SERVICES:
+        if cmd.service not in ALLOWED_ACTIONS:
             msg = f"Service '{cmd.service}' is not in the allowlist."
             logger.error("[%s] BLOCKED: %s", execution_id, msg)
             return CommandResult(
@@ -226,7 +222,7 @@ class AWSCLIExecutor:
 
         # ── 2. Security Check: Action Allowlist ────────────
         allowed_actions = ALLOWED_ACTIONS.get(cmd.service, set())
-        if allowed_actions and cmd.action not in allowed_actions:
+        if not allowed_actions or cmd.action not in allowed_actions:
             msg = f"Action '{cmd.action}' is not allowed for service '{cmd.service}'."
             logger.error("[%s] BLOCKED: %s", execution_id, msg)
             return CommandResult(

@@ -61,7 +61,7 @@ Profile: {profile}
 # Plan Generation Prompt
 # ──────────────────────────────────────────────
 
-PLAN_GENERATION_PROMPT = """Analyze the following user request and generate a structured provisioning plan.
+PLAN_GENERATION_PROMPT = """Analyze the following user request and generate a structured desired-state provisioning plan.
 
 ## User Request
 {user_request}
@@ -73,71 +73,34 @@ PLAN_GENERATION_PROMPT = """Analyze the following user request and generate a st
 {session_resources}
 
 ## Instructions
-Generate a JSON object with this EXACT structure:
+Generate a JSON object specifying the DESIRED INFRASTRUCTURE STATE with this EXACT structure:
 
 {{
-  "intent": "Brief description of what the user wants",
+  "intent": "Clear description of what the user wants to accomplish",
   "operation_type": "create|read|update|delete|list|describe|modify|start|stop|attach|detach",
-  "operation_category": "READ_ONLY|WRITE|DESTRUCTIVE",
   "aws_region": "{region}",
   "resources": [
     {{
-      "service": "ec2|s3|vpc|iam|lambda|dynamodb|cloudwatch|rds|ecs",
+      "logical_ref": "Unique reference key (e.g. 'vpc.main', 'subnet.public', 'security_group.web', 'ec2.web', 's3.bucket')",
       "resource_type": "instance|bucket|vpc|subnet|security_group|internet_gateway|route_table|role|policy|function|table|db_instance|cluster",
-      "resource_name": "name or null",
-      "configuration": {{}},
-      "dependencies": ["list of resource references this depends on"]
-    }}
-  ],
-  "dependencies": [
-    {{"from": "resource_ref_1", "to": "resource_ref_2"}}
-  ],
-  "commands": [
-    {{
-      "service": "AWS CLI service (ec2, s3api, iam, etc.)",
-      "action": "CLI action (run-instances, create-bucket, etc.)",
-      "parameters": {{
-        "param-name": "value"
+      "service": "ec2|s3|vpc|iam|lambda|dynamodb|rds|ecs",
+      "resource_name": "Descriptive name or tag for the resource, or null",
+      "configuration": {{
+        "key": "value"
       }},
-      "description": "What this command does",
-      "operation_category": "READ_ONLY|WRITE|DESTRUCTIVE",
-      "resource_ref": "reference to which resource this creates/affects",
-      "depends_on": ["command_id of commands that must complete first"],
-      "output_key": "JSON path to extract resource ID from output (e.g., 'Vpc.VpcId')"
+      "dependencies": ["list of logical_refs this resource depends on (e.g. ['vpc.main'])"],
+      "tags": {{"Name": "resource-name"}}
     }}
   ],
-  "risk_level": "LOW|MEDIUM|HIGH|CRITICAL",
-  "destructive_operations": true|false,
-  "missing_parameters": ["list of parameters you need from the user"],
-  "assumptions": ["list of assumptions you're making"],
-  "requires_approval": true|false,
-  "cost_warnings": ["list of cost-related warnings"],
-  "educational_notes": ["brief educational notes about the resources"],
-  "verification_commands": [
-    {{
-      "service": "ec2",
-      "action": "describe-instances",
-      "parameters": {{}},
-      "description": "Verify the instance was created"
-    }}
-  ],
-  "rollback_commands": [
-    {{
-      "service": "ec2",
-      "action": "terminate-instances",
-      "parameters": {{}},
-      "description": "Terminate the instance if rollback needed",
-      "operation_category": "DESTRUCTIVE"
-    }}
-  ]
+  "missing_parameters": ["List any required information not provided and unsafe to default, or empty"],
+  "assumptions": ["List any safe defaults or assumptions applied"]
 }}
 
 IMPORTANT:
-- If the user request is about listing/describing resources, set operation_category to READ_ONLY and requires_approval to false.
-- For create operations, ALWAYS include verification_commands.
-- For multi-resource operations, order commands by dependencies.
-- Use placeholder syntax {{ResourceRef.OutputKey}} for values that come from previous commands.
-- Output ONLY the JSON object, no markdown formatting, no explanation.
+- Do NOT output executable AWS CLI commands, CLI actions, syntax, or command arrays. Application code deterministically generates all AWS CLI commands.
+- For dependencies, specify the logical_ref of the prerequisite resource (e.g., subnet depends on vpc.main).
+- For referenced IDs in configuration, use placeholder syntax {{logical_ref.id}} (e.g., "vpc_id": "{{vpc.main.id}}").
+- Output ONLY valid JSON matching this schema, with no markdown formatting or commentary.
 """
 
 # ──────────────────────────────────────────────

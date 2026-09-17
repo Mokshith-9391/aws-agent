@@ -82,6 +82,7 @@ class ExecutionStatus(str, Enum):
     EXECUTING = "EXECUTING"
     SUCCESS = "SUCCESS"
     PARTIAL_SUCCESS = "PARTIAL_SUCCESS"
+    PARTIAL_FAILURE = "PARTIAL_FAILURE"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
     DRY_RUN = "DRY_RUN"
@@ -89,6 +90,7 @@ class ExecutionStatus(str, Enum):
     ROLLING_BACK = "ROLLING_BACK"
     ROLLED_BACK = "ROLLED_BACK"
     ROLLBACK_FAILED = "ROLLBACK_FAILED"
+    VERIFIED_SUCCESS = "VERIFIED_SUCCESS"
     VERIFICATION_FAILED = "VERIFICATION_FAILED"
 
 
@@ -127,14 +129,41 @@ class AWSService(str, Enum):
 
 
 # ──────────────────────────────────────────────
+# Desired-State Models (LLM Output Contract)
+# ──────────────────────────────────────────────
+
+class DesiredResource(BaseModel):
+    """A desired infrastructure resource requested by the user/LLM."""
+    logical_ref: str = Field(..., description="Stable logical reference key (e.g. 'vpc.main', 'security_group.web')")
+    resource_type: str = Field(..., description="Resource type (e.g. 'vpc', 'subnet', 'security_group', 'instance', 'bucket')")
+    service: Optional[str] = Field(None, description="Optional domain service name hint (e.g. 'vpc', 'ec2', 's3')")
+    resource_name: Optional[str] = Field(None, description="Desired resource name/tag")
+    configuration: dict[str, Any] = Field(default_factory=dict, description="Resource configuration parameters")
+    dependencies: list[str] = Field(default_factory=list, description="Logical references this resource depends on")
+    tags: dict[str, str] = Field(default_factory=dict, description="Tags for the resource")
+
+
+class DesiredStatePlan(BaseModel):
+    """The structured desired-state plan emitted by the LLM (no CLI commands)."""
+    intent: str = Field(..., description="High-level user intent")
+    operation_type: OperationType = Field(OperationType.CREATE, description="Operation type")
+    aws_region: Optional[str] = Field(None, description="Target AWS region")
+    resources: list[DesiredResource] = Field(default_factory=list, description="Desired resources")
+    missing_parameters: list[str] = Field(default_factory=list, description="Missing user info")
+    assumptions: list[str] = Field(default_factory=list, description="Assumptions made")
+
+
+# ──────────────────────────────────────────────
 # Resource Models
 # ──────────────────────────────────────────────
 
 class LogicalResource(BaseModel):
     """A logical AWS resource identified and managed by the plan."""
     resource_ref: str = Field(..., description="Stable logical reference key (e.g. 'vpc.main', 'security_group.web')")
-    resource_type: str = Field(..., description="Resource type (e.g. 'vpc', 'subnet', 'security_group', 'instance')")
-    service: str = Field(..., description="AWS service (e.g. 'ec2', 's3api', 'iam')")
+    resource_type: str = Field(..., description="Resource type (e.g. 'vpc', 'subnet', 'security_group', 'instance', 'bucket')")
+    service: str = Field(..., description="Domain service (e.g. 'vpc', 's3', 'ec2')")
+    domain_service: Optional[str] = Field(None, description="Domain service name (e.g. 'vpc', 's3', 'ec2')")
+    cli_service: str = Field(default="ec2", description="AWS CLI service name (e.g. 'ec2', 's3api', 'iam')")
     resource_id: Optional[str] = Field(None, description="Actual AWS resource ID when created or discovered")
     resource_name: Optional[str] = Field(None, description="Desired or discovered resource name")
     ownership: ResourceOwnership = Field(
@@ -143,6 +172,9 @@ class LogicalResource(BaseModel):
     )
     attributes: dict[str, Any] = Field(default_factory=dict, description="Extracted resource attributes (e.g. CidrBlock, Arn)")
     dependencies: list[str] = Field(default_factory=list, description="Logical references this resource depends on")
+    plan_id: Optional[str] = Field(None, description="Plan ID that defined this resource")
+    created_by_plan_id: Optional[str] = Field(None, description="Plan ID that created this resource")
+    execution_id: Optional[str] = Field(None, description="Execution ID that provisioned this resource")
 
 
 class ResourceConfig(BaseModel):
@@ -185,6 +217,8 @@ class CLICommand(BaseModel):
         Returns:
             Argument array starting with 'aws'.
         """
+        import json
+
         args = ["aws", self.service, self.action]
 
         # Explicit profile propagation
@@ -203,10 +237,13 @@ class CLICommand(BaseModel):
                 if value:
                     args.append(arg_key)
             elif isinstance(value, list):
-                args.append(arg_key)
-                args.extend([str(v) for v in value])
+                # If list contains dicts or lists, serialize as JSON string
+                if any(isinstance(v, (dict, list)) for v in value):
+                    args.extend([arg_key, json.dumps(value)])
+                else:
+                    args.append(arg_key)
+                    args.extend([str(v) for v in value])
             elif isinstance(value, dict):
-                import json
                 args.extend([arg_key, json.dumps(value)])
             else:
                 args.extend([arg_key, str(value)])

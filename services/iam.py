@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.models import CLICommand, OperationCategory
 from services.registry import (
     AWSServiceRegistry,
     ResourceTypeDefinition,
@@ -27,6 +28,130 @@ logger = logging.getLogger(__name__)
 SERVICE_NAME = "iam"
 CLI_SERVICE = "iam"
 SERVICE_DESCRIPTION = "AWS Identity and Access Management"
+
+# ──────────────────────────────────────────────
+# Deterministic Command Builders
+# ──────────────────────────────────────────────
+
+def build_create_role_command(
+    role_name: str,
+    assume_role_policy_document: str,
+    description: Optional[str] = None,
+    tags: Optional[list[dict[str, str]]] = None,
+    command_id: Optional[str] = None,
+    resource_ref: str = "iam.role",
+) -> CLICommand:
+    """Deterministically construct a create-role command."""
+    params: dict[str, Any] = {
+        "role-name": role_name,
+        "assume-role-policy-document": assume_role_policy_document,
+    }
+    if description:
+        params["description"] = description
+    if tags:
+        params["tags"] = tags
+
+    cmd = CLICommand(
+        command_id=command_id or "cmd-iam-create-role",
+        service="iam",
+        action="create-role",
+        parameters=params,
+        description=f"Create IAM role '{role_name}'",
+        operation_category=OperationCategory.WRITE,
+        resource_ref=resource_ref,
+        output_key="Role.Arn",
+    )
+    cmd.rollback_command = build_delete_role_command(
+        role_name=role_name,
+        resource_ref=resource_ref,
+    )
+    return cmd
+
+
+def build_delete_role_command(
+    role_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-role command."""
+    return CLICommand(
+        command_id=command_id or "cmd-iam-delete-role",
+        service="iam",
+        action="delete-role",
+        parameters={"role-name": role_name},
+        description=f"Delete IAM role '{role_name}'",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_get_role_command(
+    role_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a get-role verification command."""
+    return CLICommand(
+        command_id=command_id or "cmd-iam-get-role",
+        service="iam",
+        action="get-role",
+        parameters={"role-name": role_name},
+        description=f"Verify IAM role '{role_name}'",
+        operation_category=OperationCategory.READ_ONLY,
+        resource_ref=resource_ref,
+    )
+
+
+def build_create_policy_command(
+    policy_name: str,
+    policy_document: str,
+    description: Optional[str] = None,
+    tags: Optional[list[dict[str, str]]] = None,
+    command_id: Optional[str] = None,
+    resource_ref: str = "iam.policy",
+) -> CLICommand:
+    """Deterministically construct a create-policy command."""
+    params: dict[str, Any] = {
+        "policy-name": policy_name,
+        "policy-document": policy_document,
+    }
+    if description:
+        params["description"] = description
+    if tags:
+        params["tags"] = tags
+
+    cmd = CLICommand(
+        command_id=command_id or "cmd-iam-create-policy",
+        service="iam",
+        action="create-policy",
+        parameters=params,
+        description=f"Create IAM policy '{policy_name}'",
+        operation_category=OperationCategory.WRITE,
+        resource_ref=resource_ref,
+        output_key="Policy.Arn",
+    )
+    cmd.rollback_command = build_delete_policy_command(
+        policy_arn=f"{{{{{resource_ref}.id}}}}",
+        resource_ref=resource_ref,
+    )
+    return cmd
+
+
+def build_delete_policy_command(
+    policy_arn: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-policy command."""
+    return CLICommand(
+        command_id=command_id or "cmd-iam-delete-policy",
+        service="iam",
+        action="delete-policy",
+        parameters={"policy-arn": policy_arn},
+        description=f"Delete IAM policy '{policy_arn}'",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
 
 # ──────────────────────────────────────────────
 # Pydantic Parameter Models

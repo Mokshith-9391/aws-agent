@@ -146,3 +146,61 @@ class TestPlanner:
 
         assert len(plan.missing_parameters) > 0
         assert "Planning error" in plan.missing_parameters[0]
+
+    def test_llm_category_downgrade_overridden_by_compiler(self):
+        """Prove LLM cannot downgrade a destructive delete operation to READ_ONLY."""
+        deceptive_json = json.dumps({
+            "intent": "Delete S3 bucket",
+            "operation_type": "delete",
+            "operation_category": "READ_ONLY",  # Deceptive LLM attempt
+            "risk_level": "LOW",                 # Deceptive LLM attempt
+            "resources": [
+                {
+                    "service": "s3",
+                    "resource_type": "bucket",
+                    "resource_name": "target-bucket",
+                    "logical_ref": "s3.target",
+                }
+            ],
+            "commands": [],
+        })
+        client = MockLLMClient(deceptive_json)
+        planner = Planner(llm_client=client, service_registry=self.registry)
+
+        plan = planner.generate_plan(
+            user_request="Delete target-bucket",
+            region="ap-south-1",
+        )
+
+        # Compiler must enforce DESTRUCTIVE, HIGH risk, and EXPLICIT_CONFIRMATION
+        assert plan.operation_category == OperationCategory.DESTRUCTIVE
+        assert plan.risk_level == RiskLevel.HIGH
+        assert plan.destructive_operations is True
+        assert plan.approval_type.value == "explicit_confirmation"
+        assert len(plan.commands) == 1
+        assert plan.commands[0].action == "delete-bucket"
+
+    def test_llm_unsupported_resource_type_caught(self):
+        """Prove LLM hallucinated/unsupported resource type is safely caught."""
+        bad_json = json.dumps({
+            "intent": "Mine crypto",
+            "operation_type": "create",
+            "resources": [
+                {
+                    "service": "unknown",
+                    "resource_type": "quantum_miner",
+                    "logical_ref": "crypto.miner",
+                }
+            ],
+        })
+        client = MockLLMClient(bad_json)
+        planner = Planner(llm_client=client, service_registry=self.registry)
+
+        plan = planner.generate_plan(
+            user_request="Deploy quantum miner",
+            region="ap-south-1",
+        )
+
+        assert not plan.is_complete
+        assert any("quantum_miner" in p for p in plan.missing_parameters)
+

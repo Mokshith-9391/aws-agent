@@ -171,3 +171,102 @@ class TestAWSCLIExecutor:
         assert ids.get("VpcId") == "vpc-0987654321fedcba0"
         assert ids.get("RoleName") == "MyTestRole"
         assert ids.get("Arn") == "arn:aws:iam::123456789012:role/MyTestRole"
+
+    def test_unlisted_service_route53_rejected(self):
+        """Verify unmaintained/unregistered service route53 is strictly rejected."""
+        cmd = CLICommand(
+            service="route53",
+            action="list-hosted-zones",
+            parameters={},
+            description="List hosted zones",
+            operation_category=OperationCategory.READ_ONLY,
+        )
+        result = self.executor.execute_command(cmd, region="us-east-1", dry_run=False)
+        assert result.success is False
+        assert result.error_type == "ServiceNotAllowed"
+        assert "not in the allowlist" in result.stderr
+
+    def test_unlisted_service_fake_rejected(self):
+        """Verify arbitrary unknown service is strictly rejected."""
+        cmd = CLICommand(
+            service="fake_svc",
+            action="pwn",
+            parameters={},
+            description="Exploit attempt",
+            operation_category=OperationCategory.READ_ONLY,
+        )
+        result = self.executor.execute_command(cmd, region="us-east-1", dry_run=False)
+        assert result.success is False
+        assert result.error_type == "ServiceNotAllowed"
+
+    def test_unregistered_action_rejected(self):
+        """Verify unapproved action on allowed service ec2 is strictly rejected."""
+        cmd = CLICommand(
+            service="ec2",
+            action="delete-account",
+            parameters={},
+            description="Non-existent/disallowed ec2 action",
+            operation_category=OperationCategory.DESTRUCTIVE,
+        )
+        result = self.executor.execute_command(cmd, region="us-east-1", dry_run=False)
+        assert result.success is False
+        assert result.error_type == "ActionNotAllowed"
+
+    def test_complex_parameter_serialization_tag_specifications(self):
+        """Verify complex parameters like tag specifications serialize to valid JSON strings in CLI args."""
+        tags = [
+            {
+                "ResourceType": "instance",
+                "Tags": [{"Key": "Name", "Value": "WebServer"}, {"Key": "Env", "Value": "Prod"}],
+            }
+        ]
+        cmd = CLICommand(
+            service="ec2",
+            action="run-instances",
+            parameters={
+                "image-id": "ami-12345678",
+                "instance-type": "t3.micro",
+                "tag-specifications": tags,
+            },
+            description="Launch instance with tags",
+            operation_category=OperationCategory.WRITE,
+        )
+
+        args = cmd.to_cli_args(profile="default", region="ap-south-1")
+        assert "--tag-specifications" in args
+        idx = args.index("--tag-specifications")
+        json_val = args[idx + 1]
+
+        # Must parse as valid JSON matching the input structure
+        parsed = json.loads(json_val)
+        assert parsed == tags
+        assert parsed[0]["ResourceType"] == "instance"
+        assert parsed[0]["Tags"][0]["Key"] == "Name"
+
+    def test_dict_parameter_serialization(self):
+        """Verify dict parameters serialize to valid JSON strings."""
+        policy_doc = {
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "*"}
+            ]
+        }
+        cmd = CLICommand(
+            service="iam",
+            action="create-policy",
+            parameters={
+                "policy-name": "TestPolicy",
+                "policy-document": policy_doc,
+            },
+            description="Create policy",
+            operation_category=OperationCategory.WRITE,
+        )
+
+        args = cmd.to_cli_args()
+        assert "--policy-document" in args
+        idx = args.index("--policy-document")
+        json_val = args[idx + 1]
+
+        parsed = json.loads(json_val)
+        assert parsed["Statement"][0]["Action"] == "s3:ListBucket"
+

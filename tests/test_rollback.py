@@ -172,3 +172,136 @@ class TestRollbackEngine:
 
         # Higher order executed first
         assert executed_actions == ["delete-subnet", "delete-vpc"]
+
+    def test_generate_rollback_commands_midflight_failure(self):
+        """Test rollback command generation when plan partially fails at step 3."""
+        # Setup resources in context
+        self.context.register_resource(
+            LogicalResource(
+                resource_ref="vpc.main",
+                service="vpc",
+                cli_service="ec2",
+                resource_type="vpc",
+                resource_id="vpc-11111",
+                ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
+            )
+        )
+        self.context.register_resource(
+            LogicalResource(
+                resource_ref="subnet.main",
+                service="vpc",
+                cli_service="ec2",
+                resource_type="subnet",
+                resource_id="subnet-22222",
+                ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
+            )
+        )
+
+        cmd1 = CLICommand(
+            command_id="cmd-1",
+            service="ec2",
+            action="create-vpc",
+            parameters={"cidr-block": "10.0.0.0/16"},
+            resource_ref="vpc.main",
+            rollback_command=CLICommand(
+                command_id="rb-1",
+                service="ec2",
+                action="delete-vpc",
+                parameters={"vpc-id": "{{vpc.main.id}}"},
+                operation_category=OperationCategory.DESTRUCTIVE,
+            ),
+        )
+        cmd2 = CLICommand(
+            command_id="cmd-2",
+            service="ec2",
+            action="create-subnet",
+            parameters={"vpc-id": "{{vpc.main.id}}", "cidr-block": "10.0.1.0/24"},
+            resource_ref="subnet.main",
+            rollback_command=CLICommand(
+                command_id="rb-2",
+                service="ec2",
+                action="delete-subnet",
+                parameters={"subnet-id": "{{subnet.main.id}}"},
+                operation_category=OperationCategory.DESTRUCTIVE,
+            ),
+        )
+        cmd3 = CLICommand(
+            command_id="cmd-3",
+            service="ec2",
+            action="run-instances",
+            parameters={"subnet-id": "{{subnet.main.id}}"},
+            resource_ref="ec2.instance",
+        )
+
+        plan = ProvisioningPlan(
+            user_request="Build VPC, subnet and EC2",
+            intent="Build VPC, subnet and EC2",
+            operation_type=OperationType.CREATE,
+            operation_category=OperationCategory.WRITE,
+            aws_region="ap-south-1",
+            commands=[cmd1, cmd2, cmd3],
+        )
+
+        from agent.models import ExecutionResult, CommandExecutionStatus
+        exec_result = ExecutionResult(
+            plan_id=plan.plan_id,
+            command_results=[
+                CommandResult(command_id="cmd-1", exit_code=0, success=True, status=CommandExecutionStatus.SUCCESS),
+                CommandResult(command_id="cmd-2", exit_code=0, success=True, status=CommandExecutionStatus.SUCCESS),
+                CommandResult(command_id="cmd-3", exit_code=1, success=False, status=CommandExecutionStatus.FAILED, error_message="InsufficientCapacity"),
+            ],
+        )
+
+        rb_cmds = self.rollback_engine.generate_rollback_commands(
+            plan=plan,
+            execution_result=exec_result,
+            context=self.context,
+        )
+
+        # Only succeeded commands with rollback definitions are rolled back (cmd2, then cmd1)
+        assert len(rb_cmds) == 2
+        assert rb_cmds[0].action == "delete-subnet"
+        assert rb_cmds[0].parameters["subnet-id"] == "subnet-22222"
+        assert rb_cmds[1].action == "delete-vpc"
+        assert rb_cmds[1].parameters["vpc-id"] == "vpc-11111"
+
+    def test_rollback_skips_unresolved_placeholders(self):
+        """Test that rollback commands with unresolvable placeholders are skipped safely."""
+        cmd1 = CLICommand(
+            command_id="cmd-1",
+            service="ec2",
+            action="create-vpc",
+            parameters={"cidr-block": "10.0.0.0/16"},
+            resource_ref="vpc.orphan",
+            rollback_command=CLICommand(
+                command_id="rb-1",
+                service="ec2",
+                action="delete-vpc",
+                parameters={"vpc-id": "{{unregistered_ref.id}}"},
+                operation_category=OperationCategory.DESTRUCTIVE,
+            ),
+        )
+        plan = ProvisioningPlan(
+            user_request="Build orphaned vpc",
+            intent="Build orphaned vpc",
+            operation_type=OperationType.CREATE,
+            operation_category=OperationCategory.WRITE,
+            aws_region="ap-south-1",
+            commands=[cmd1],
+        )
+        from agent.models import ExecutionResult, CommandExecutionStatus
+        exec_result = ExecutionResult(
+            plan_id=plan.plan_id,
+            command_results=[
+                CommandResult(command_id="cmd-1", exit_code=0, success=True, status=CommandExecutionStatus.SUCCESS),
+            ],
+        )
+
+        rb_cmds = self.rollback_engine.generate_rollback_commands(
+            plan=plan,
+            execution_result=exec_result,
+            context=self.context,
+        )
+        # Should be empty because placeholder cannot be resolved
+        assert len(rb_cmds) == 0
+

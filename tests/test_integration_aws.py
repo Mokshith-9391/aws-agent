@@ -44,3 +44,17 @@ class TestLiveAWSIntegration:
         discovery = ResourceDiscovery()
         vpcs = discovery.discover_vpcs(region=self.region, profile=self.profile)
         assert isinstance(vpcs, list)
+
+    def test_live_read_only_plan_execution(self):
+        from agent.orchestrator import AgentOrchestrator
+        from agent.models import ExecutionStatus
+        orchestrator = AgentOrchestrator(settings)
+        resp = orchestrator.process_request(
+            user_request="List all EC2 instances",
+            region=self.region,
+            profile=self.profile,
+            dry_run=False,
+        )
+        assert resp.execution_result is not None
+        assert resp.execution_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.DRY_RUN)
+

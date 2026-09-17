@@ -81,7 +81,7 @@ class AgentOrchestrator:
         self._sanitizer = OutputSanitizer()
         self._history_store = ExecutionStore()
         self._rollback_engine = RollbackEngine(self._executor)
-        self._registry: Optional[AWSServiceRegistry] = None
+        self._registry: AWSServiceRegistry = create_default_registry()
 
         # Session state
         self._conversation_history: list[dict] = []
@@ -279,12 +279,40 @@ class AgentOrchestrator:
             learning_mode=learning_mode,
         )
 
+    @staticmethod
+    def _extract_id_by_path(data: Any, path: Optional[str]) -> Optional[str]:
+        """Extract a value from nested dicts/lists using dot/bracket notation like 'Vpc.VpcId' or 'Instances[0].InstanceId'."""
+        if not path or not isinstance(data, dict):
+            return None
+        current = data
+        for part in path.split("."):
+            if "[" in part and "]" in part:
+                field = part[:part.index("[")]
+                idx_str = part[part.index("[") + 1:part.index("]")]
+                try:
+                    idx = int(idx_str)
+                except ValueError:
+                    return None
+                current = current.get(field, []) if isinstance(current, dict) else []
+                if isinstance(current, list) and len(current) > idx:
+                    current = current[idx]
+                else:
+                    return None
+            else:
+                if isinstance(current, dict):
+                    current = current.get(part)
+                else:
+                    return None
+        return str(current) if current is not None else None
+
     def execute_approved_plan(
         self,
         plan: ProvisioningPlan,
         region: str,
         profile: str = "default",
         learning_mode: bool = False,
+        confirmation_token: Optional[str] = None,
+        auto_rollback: bool = False,
     ) -> AgentResponse:
         """Execute an approved provisioning plan using the effective profile and region.
 
@@ -293,8 +321,30 @@ class AgentOrchestrator:
         operations on failure, verifies actual AWS state, and generates technical explanations.
         """
         logger.info("Executing approved plan: %s (profile=%s, region=%s)", plan.plan_id, profile, region)
-        start_time = time.time()
 
+        # ── Step 0: Backend Approval Re-validation ───────────────────
+        approval_req = self._approval_manager.determine_approval_requirement(plan)
+        if approval_req.get("approval_type") == ApprovalType.EXPLICIT_CONFIRMATION or plan.approval_type == ApprovalType.EXPLICIT_CONFIRMATION:
+            if not confirmation_token or confirmation_token.strip().upper() != "CONFIRM DELETE":
+                logger.warning("Plan %s blocked: explicit confirmation token 'CONFIRM DELETE' missing or incorrect", plan.plan_id)
+                return AgentResponse(
+                    message="❌ **Execution Blocked**: This operation involves destructive actions and requires explicit confirmation. Please provide confirmation token 'CONFIRM DELETE'.",
+                    plan=plan,
+                    approval_type=ApprovalType.EXPLICIT_CONFIRMATION,
+                    warnings=["Explicit confirmation token 'CONFIRM DELETE' required."],
+                )
+
+        # Re-check policy safety before execution
+        is_safe, _, blocking = self._policy_engine.evaluate_plan(plan)
+        if not is_safe:
+            logger.error("Plan %s blocked by safety policy during execution pre-check", plan.plan_id)
+            return AgentResponse(
+                message="🚫 **Operation Blocked by Safety Policy:**\n" + "\n".join(f"- 🛑 {b}" for b in blocking),
+                plan=plan,
+                warnings=blocking,
+            )
+
+        start_time = time.time()
         execution_result = ExecutionResult(
             plan_id=plan.plan_id,
             status=ExecutionStatus.EXECUTING,
@@ -325,7 +375,7 @@ class AgentOrchestrator:
                 execution_result.skipped_commands.append(f"{cmd.service}/{cmd.action} (dependency failed)")
                 continue
 
-            # ── Resolve Placeholders Recursively (Critical Fix #5) ───
+            # ── Resolve Placeholders Recursively ─────────────────────
             try:
                 resolved_params = self._resource_context.resolve_placeholders_recursively(cmd.parameters)
                 resolved_cmd = cmd.model_copy()
@@ -349,7 +399,6 @@ class AgentOrchestrator:
                 )
                 command_results.append(err_res)
                 failed_resources.append(f"{cmd.service}/{cmd.action}: {ure}")
-                # Mark downstream dependents as skipped
                 downstream = dep_graph.get_transitive_dependents(cmd.command_id)
                 skipped_command_ids.update(downstream)
                 continue
@@ -365,26 +414,72 @@ class AgentOrchestrator:
             command_results.append(result)
 
             if result.success:
-                # Register created resource in ResourceContext with CREATED_BY_THIS_PLAN ownership
-                ref = cmd.resource_ref or f"{cmd.service}.{cmd.action.split('-')[-1]}"
-                res_id = None
-                if result.resource_ids:
-                    # Pick primary ID
-                    res_id = next(iter(result.resource_ids.values()))
-                    created_resources[ref] = res_id
+                if cmd.operation_category != OperationCategory.DESTRUCTIVE:
+                    ref = cmd.resource_ref or f"{cmd.service}.{cmd.action.split('-')[-1]}"
 
-                self._resource_context.register_resource(
-                    resource_ref=ref,
-                    resource_type=cmd.service,
-                    service=cmd.service,
-                    resource_id=res_id,
-                    ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
-                    attributes=result.resource_ids,
-                )
+                    # Look up logical resource in plan
+                    lr = None
+                    if hasattr(plan, "get_resource"):
+                        lr = plan.get_resource(ref)
+                    if not lr and hasattr(plan, "logical_resources"):
+                        for item in plan.logical_resources:
+                            if item.resource_ref == ref:
+                                lr = item
+                                break
+
+                    # Resolve authoritative domain service and resource_type
+                    if lr:
+                        domain_svc = lr.domain_service or lr.service
+                        res_type = lr.resource_type
+                        cli_svc = lr.cli_service or cmd.service
+                    else:
+                        rt_def = self._registry.find_resource_type(cmd.service, cmd.action) if self._registry else None
+                        if rt_def:
+                            domain_svc = rt_def.service
+                            res_type = rt_def.resource_type
+                            cli_svc = rt_def.cli_service
+                        else:
+                            domain_svc = cmd.service
+                            res_type = cmd.service
+                            cli_svc = cmd.service
+
+                    # Extract primary resource ID
+                    res_id = None
+                    if cmd.service in ("s3", "s3api") and cmd.action == "create-bucket":
+                        res_id = cmd.parameters.get("bucket") or result.resource_ids.get("BucketName") or result.resource_ids.get("bucket")
+                    elif result.parsed_output and self._registry:
+                        rt_def = self._registry.get_resource_type(domain_svc, res_type)
+                        if rt_def and rt_def.id_field:
+                            res_id = self._extract_id_by_path(result.parsed_output, rt_def.id_field)
+
+                    if not res_id and result.resource_ids:
+                        res_id = next(iter(result.resource_ids.values()))
+
+                    if not res_id:
+                        for k in ("bucket", "table-name", "role-name", "group-name", "cluster-name"):
+                            if k in cmd.parameters:
+                                res_id = str(cmd.parameters[k])
+                                break
+
+                    if res_id:
+                        created_resources[ref] = res_id
+
+                    self._resource_context.register_resource(
+                        resource_ref=ref,
+                        resource_type=res_type,
+                        service=domain_svc,
+                        resource_id=res_id,
+                        ownership=ResourceOwnership.CREATED_BY_THIS_PLAN,
+                        attributes=result.resource_ids,
+                    )
+                    if lr:
+                        lr.resource_id = res_id
+                        lr.plan_id = plan.plan_id
+                        lr.created_by_plan_id = plan.plan_id
+                        lr.execution_id = execution_result.execution_id
             else:
                 failed_msg = f"{cmd.service}/{cmd.action}: {result.error_message or 'Command returned non-zero exit code'}"
                 failed_resources.append(failed_msg)
-                # Smart skipping: mark all downstream dependents to skip
                 downstream = dep_graph.get_transitive_dependents(cmd.command_id)
                 skipped_command_ids.update(downstream)
 
@@ -394,11 +489,40 @@ class AgentOrchestrator:
         execution_result.duration_seconds = time.time() - start_time
         execution_result.update_counts()
 
-        # ── Step 12: Live Resource Verification (Critical Fix #15/16) ─
-        if execution_result.status in (ExecutionStatus.SUCCESS, ExecutionStatus.PARTIAL_SUCCESS):
+        # ── Step 12: Handle Execution State & Live Verification ───────
+        if failed_resources:
+            if created_resources and auto_rollback:
+                logger.warning("Plan %s encountered partial failure with auto_rollback=True. Executing rollback...", plan.plan_id)
+                execution_result.status = ExecutionStatus.ROLLING_BACK
+                rb_commands = self._rollback_engine.generate_rollback_commands(
+                    plan=plan,
+                    execution_result=execution_result,
+                    context=self._resource_context,
+                )
+                if rb_commands:
+                    rb_results = self._rollback_engine.execute_rollback(
+                        rollback_commands=rb_commands,
+                        region=region,
+                        profile=profile,
+                        resource_context=self._resource_context,
+                    )
+                    all_rb_ok = all(r.success for r in rb_results)
+                    execution_result.status = ExecutionStatus.ROLLED_BACK if all_rb_ok else ExecutionStatus.ROLLBACK_FAILED
+                else:
+                    execution_result.status = ExecutionStatus.ROLLED_BACK
+            elif created_resources:
+                logger.info("Plan %s encountered partial failure. Created resources present, setting status to ROLLBACK_PENDING.", plan.plan_id)
+                execution_result.status = ExecutionStatus.ROLLBACK_PENDING
+            else:
+                execution_result.status = ExecutionStatus.FAILED
+        elif execution_result.successful_commands > 0 and execution_result.failed_commands == 0:
             verification_results = self._verify_created_resources(region=region, profile=profile)
             execution_result.verification_results = verification_results
-            execution_result.update_counts()
+            has_failed_verification = any(not vr.verified for vr in verification_results)
+            if has_failed_verification:
+                execution_result.status = ExecutionStatus.VERIFICATION_FAILED
+            else:
+                execution_result.status = ExecutionStatus.SUCCESS
 
         # ── Step 13: Post-Execution Technical Explanation ─────────────
         explanation = ""
@@ -417,8 +541,14 @@ class AgentOrchestrator:
 
         # ── Step 15: Build Consolidated Response ──────────────────────
         warnings = plan.cost_warnings.copy()
-        if execution_result.status == ExecutionStatus.PARTIAL_SUCCESS:
+        if execution_result.status == ExecutionStatus.PARTIAL_FAILURE:
             warnings.append("⚠️ Some operations failed. Dependent operations were safely skipped.")
+        elif execution_result.status == ExecutionStatus.ROLLBACK_PENDING:
+            warnings.append("⚠️ Execution failed mid-flight. Resources were partially provisioned. Rollback is pending authorization.")
+        elif execution_result.status == ExecutionStatus.ROLLED_BACK:
+            warnings.append("🔄 Execution failed and all provisioned resources were successfully rolled back.")
+        elif execution_result.status == ExecutionStatus.ROLLBACK_FAILED:
+            warnings.append("❌ Rollback failed for one or more resources. Manual cleanup may be required.")
         elif execution_result.status == ExecutionStatus.FAILED:
             warnings.append("❌ All operations failed. Check credentials, permissions, and parameters.")
         elif execution_result.status == ExecutionStatus.VERIFICATION_FAILED:
@@ -433,6 +563,52 @@ class AgentOrchestrator:
             educational_content=educational_content,
             warnings=warnings,
             resource_summary=created_resources,
+        )
+
+    def execute_rollback_for_plan(
+        self,
+        plan: ProvisioningPlan,
+        execution_result: ExecutionResult,
+        region: str,
+        profile: str = "default",
+        confirmation_token: Optional[str] = None,
+    ) -> AgentResponse:
+        """Execute rollback for a partially failed plan upon explicit user authorization."""
+        if not confirmation_token or confirmation_token.strip().upper() not in ("CONFIRM DELETE", "CONFIRM ROLLBACK"):
+            return AgentResponse(
+                message="❌ Rollback authorization failed: explicit confirmation token 'CONFIRM ROLLBACK' or 'CONFIRM DELETE' required.",
+                plan=plan,
+                execution_result=execution_result,
+                warnings=["Rollback confirmation token required."],
+            )
+
+        execution_result.status = ExecutionStatus.ROLLING_BACK
+        rb_commands = self._rollback_engine.generate_rollback_commands(
+            plan=plan,
+            execution_result=execution_result,
+            context=self._resource_context,
+        )
+        rb_results = []
+        if rb_commands:
+            rb_results = self._rollback_engine.execute_rollback(
+                rollback_commands=rb_commands,
+                region=region,
+                profile=profile,
+                resource_context=self._resource_context,
+            )
+            all_rb_ok = all(r.success for r in rb_results)
+            execution_result.status = ExecutionStatus.ROLLED_BACK if all_rb_ok else ExecutionStatus.ROLLBACK_FAILED
+        else:
+            execution_result.status = ExecutionStatus.ROLLED_BACK
+
+        explanation = f"Rollback completed with status: {execution_result.status.value}"
+        self._save_to_history(plan, execution_result, explanation, profile=profile, region=region)
+
+        return AgentResponse(
+            message=explanation,
+            plan=plan,
+            execution_result=execution_result,
+            warnings=["Rollback executed."] if execution_result.status == ExecutionStatus.ROLLED_BACK else ["Rollback failed for some resources."],
         )
 
     def _verify_created_resources(self, region: str, profile: str) -> list[VerificationResult]:

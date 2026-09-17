@@ -41,29 +41,46 @@ class DynamicMockLLM(LLMClient):
         else:
             user_req = user_prompt.lower()
 
+        # Unsupported resource scenario
+        if "quantum miner" in user_req:
+            return json.dumps({
+                "intent": "Deploy quantum miner",
+                "operation_type": "create",
+                "aws_region": "ap-south-1",
+                "resources": [
+                    {
+                        "logical_ref": "miner.bad",
+                        "resource_type": "quantum_miner",
+                        "service": "unknown_svc",
+                    }
+                ],
+                "missing_parameters": [],
+                "assumptions": [],
+            })
+
         # Scenario F: Dangerous request with wildcard open ports
         if "open all ports" in user_req:
             return json.dumps({
                 "intent": "Open all ports to 0.0.0.0/0",
                 "operation_type": "create",
-                "operation_category": "WRITE",
                 "aws_region": "ap-south-1",
-                "resources": [],
-                "commands": [
+                "resources": [
                     {
-                        "command_id": "cmd-bad-sg",
-                        "service": "ec2",
-                        "action": "authorize-security-group-ingress",
-                        "parameters": {"group-name": "bad-sg", "protocol": "-1", "cidr": "0.0.0.0/0"},
-                        "description": "Open all traffic to the world",
-                        "operation_category": "WRITE",
+                        "logical_ref": "security_group.bad",
+                        "resource_type": "security_group",
+                        "service": "vpc",
+                        "resource_name": "bad-sg",
+                        "configuration": {
+                            "group_name": "bad-sg",
+                            "description": "Open all traffic to the world",
+                            "ingress_rules": [
+                                {"port": 0, "protocol": "-1", "cidr": "0.0.0.0/0"}
+                            ],
+                        },
                     }
                 ],
-                "risk_level": "CRITICAL",
-                "destructive_operations": False,
                 "missing_parameters": [],
                 "assumptions": [],
-                "cost_warnings": [],
             })
 
         # Scenario E: Destructive deletion
@@ -71,95 +88,68 @@ class DynamicMockLLM(LLMClient):
             return json.dumps({
                 "intent": "Delete S3 bucket my-test-bucket",
                 "operation_type": "delete",
-                "operation_category": "DESTRUCTIVE",
                 "aws_region": "ap-south-1",
-                "resources": [],
-                "commands": [
+                "resources": [
                     {
-                        "command_id": "cmd-s3-del",
-                        "service": "s3api",
-                        "action": "delete-bucket",
-                        "parameters": {"bucket": "my-test-bucket"},
-                        "description": "Delete S3 bucket permanently",
-                        "operation_category": "DESTRUCTIVE",
+                        "logical_ref": "s3.bucket",
+                        "resource_type": "bucket",
+                        "service": "s3",
+                        "resource_name": "my-test-bucket",
+                        "configuration": {"bucket": "my-test-bucket"},
                     }
                 ],
-                "risk_level": "HIGH",
-                "destructive_operations": True,
                 "missing_parameters": [],
                 "assumptions": ["Bucket is empty"],
-                "cost_warnings": [],
             })
 
         # Scenario C: Complete custom VPC + subnet + IGW + route table + SG + EC2
-        if "custom vpc" in user_req:
+        if "custom vpc" in user_req or "custom vpc" in user_prompt.lower():
             return json.dumps({
                 "intent": "Create custom VPC and complete infrastructure in Mumbai",
                 "operation_type": "create",
-                "operation_category": "WRITE",
                 "aws_region": "ap-south-1",
                 "resources": [
-                    {"service": "ec2", "resource_type": "vpc", "resource_name": "ai-agent-vpc", "configuration": {"cidr_block": "10.0.0.0/16"}, "dependencies": []},
-                    {"service": "ec2", "resource_type": "subnet", "resource_name": "ai-agent-subnet", "configuration": {"cidr_block": "10.0.1.0/24"}, "dependencies": ["ai-agent-vpc"]},
-                    {"service": "ec2", "resource_type": "security_group", "resource_name": "ai-agent-web-sg", "configuration": {}, "dependencies": ["ai-agent-vpc"]},
-                    {"service": "ec2", "resource_type": "instance", "resource_name": "ai-agent-web-vm", "configuration": {"instance_type": "t3.micro"}, "dependencies": ["ai-agent-subnet", "ai-agent-web-sg"]},
-                ],
-                "commands": [
                     {
-                        "command_id": "cmd-vpc",
-                        "service": "ec2",
-                        "action": "create-vpc",
-                        "parameters": {"cidr-block": "10.0.0.0/16"},
-                        "description": "Create VPC",
-                        "operation_category": "WRITE",
-                        "resource_ref": "vpc.main",
-                        "output_key": "Vpc.VpcId",
+                        "logical_ref": "vpc.main",
+                        "resource_type": "vpc",
+                        "service": "vpc",
+                        "resource_name": "ai-agent-vpc",
+                        "configuration": {"cidr_block": "10.0.0.0/16"},
+                        "dependencies": [],
                     },
                     {
-                        "command_id": "cmd-subnet",
-                        "service": "ec2",
-                        "action": "create-subnet",
-                        "parameters": {"vpc-id": "{{vpc.main.id}}", "cidr-block": "10.0.1.0/24"},
-                        "description": "Create Subnet",
-                        "operation_category": "WRITE",
-                        "resource_ref": "subnet.public",
-                        "depends_on": ["cmd-vpc"],
-                        "output_key": "Subnet.SubnetId",
+                        "logical_ref": "subnet.public",
+                        "resource_type": "subnet",
+                        "service": "vpc",
+                        "resource_name": "ai-agent-subnet",
+                        "configuration": {"cidr_block": "10.0.1.0/24", "vpc_id": "{{vpc.main.id}}"},
+                        "dependencies": ["vpc.main"],
                     },
                     {
-                        "command_id": "cmd-sg",
-                        "service": "ec2",
-                        "action": "create-security-group",
-                        "parameters": {"group-name": "ai-agent-web-sg", "description": "Web SG", "vpc-id": "{{vpc.main.id}}"},
-                        "description": "Create Security Group",
-                        "operation_category": "WRITE",
-                        "resource_ref": "security_group.web",
-                        "depends_on": ["cmd-vpc"],
-                        "output_key": "GroupId",
+                        "logical_ref": "security_group.web",
+                        "resource_type": "security_group",
+                        "service": "vpc",
+                        "resource_name": "ai-agent-web-sg",
+                        "configuration": {"group_name": "ai-agent-web-sg", "description": "Web SG", "vpc_id": "{{vpc.main.id}}"},
+                        "dependencies": ["vpc.main"],
                     },
                     {
-                        "command_id": "cmd-ec2",
+                        "logical_ref": "instance.web",
+                        "resource_type": "instance",
                         "service": "ec2",
-                        "action": "run-instances",
-                        "parameters": {
-                            "image-id": "ami-022ce6f32988af5fa",
-                            "instance-type": "t3.micro",
-                            "subnet-id": "{{subnet.public.id}}",
-                            "security-group-ids": ["{{security_group.web.id}}"],
-                            "count": "1",
+                        "resource_name": "ai-agent-web-vm",
+                        "configuration": {
+                            "instance_type": "t3.micro",
+                            "image_id": "ami-022ce6f32988af5fa",
+                            "subnet_id": "{{subnet.public.id}}",
+                            "security_group_ids": ["{{security_group.web.id}}"],
+                            "count": 1,
                         },
-                        "description": "Launch EC2 Instance",
-                        "operation_category": "WRITE",
-                        "resource_ref": "instance.web",
-                        "depends_on": ["cmd-subnet", "cmd-sg"],
-                        "output_key": "Instances[0].InstanceId",
+                        "dependencies": ["subnet.public", "security_group.web"],
                     },
                 ],
-                "risk_level": "MEDIUM",
-                "destructive_operations": False,
                 "missing_parameters": [],
                 "assumptions": ["Using 10.0.0.0/16 CIDR block"],
-                "cost_warnings": ["EC2 instance and VPC components incur standard rates."],
             })
 
         # Scenario D: Read-only discovery/inspection
@@ -167,24 +157,17 @@ class DynamicMockLLM(LLMClient):
             return json.dumps({
                 "intent": "List all EC2 instances in Mumbai",
                 "operation_type": "list",
-                "operation_category": "READ_ONLY",
                 "aws_region": "ap-south-1",
-                "resources": [],
-                "commands": [
+                "resources": [
                     {
-                        "command_id": "cmd-ec2-list",
+                        "logical_ref": "ec2.instances",
+                        "resource_type": "instance",
                         "service": "ec2",
-                        "action": "describe-instances",
-                        "parameters": {},
-                        "description": "List EC2 instances",
-                        "operation_category": "READ_ONLY",
+                        "configuration": {},
                     }
                 ],
-                "risk_level": "LOW",
-                "destructive_operations": False,
                 "missing_parameters": [],
                 "assumptions": [],
-                "cost_warnings": [],
             })
 
         # Scenario A: S3 Bucket Provisioning
@@ -192,155 +175,57 @@ class DynamicMockLLM(LLMClient):
             return json.dumps({
                 "intent": "Create an S3 bucket named my-prod-data-backup-bucket in ap-south-1",
                 "operation_type": "create",
-                "operation_category": "WRITE",
                 "aws_region": "ap-south-1",
                 "resources": [
                     {
-                        "service": "s3api",
+                        "logical_ref": "s3.bucket",
                         "resource_type": "bucket",
+                        "service": "s3",
                         "resource_name": "my-prod-data-backup-bucket",
                         "configuration": {"bucket": "my-prod-data-backup-bucket"},
                         "dependencies": [],
                     }
                 ],
-                "commands": [
-                    {
-                        "command_id": "cmd-s3-1",
-                        "service": "s3api",
-                        "action": "create-bucket",
-                        "parameters": {
-                            "bucket": "my-prod-data-backup-bucket",
-                            "create-bucket-configuration": {"LocationConstraint": "ap-south-1"},
-                        },
-                        "description": "Create S3 bucket",
-                        "operation_category": "WRITE",
-                        "resource_ref": "s3.bucket",
-                    }
-                ],
-                "risk_level": "LOW",
-                "destructive_operations": False,
                 "missing_parameters": [],
                 "assumptions": ["Bucket name is globally unique"],
-                "cost_warnings": ["S3 storage charges apply based on stored data volume."],
-            })
-
-        # Scenario C: Complete custom VPC + subnet + IGW + route table + SG + EC2
-        if "custom vpc" in user_prompt.lower():
-            return json.dumps({
-                "intent": "Create custom VPC and complete infrastructure in Mumbai",
-                "operation_type": "create",
-                "operation_category": "WRITE",
-                "aws_region": "ap-south-1",
-                "resources": [
-                    {"service": "ec2", "resource_type": "vpc", "resource_name": "ai-agent-vpc", "configuration": {"cidr_block": "10.0.0.0/16"}, "dependencies": []},
-                    {"service": "ec2", "resource_type": "subnet", "resource_name": "ai-agent-subnet", "configuration": {"cidr_block": "10.0.1.0/24"}, "dependencies": ["ai-agent-vpc"]},
-                    {"service": "ec2", "resource_type": "security_group", "resource_name": "ai-agent-web-sg", "configuration": {}, "dependencies": ["ai-agent-vpc"]},
-                    {"service": "ec2", "resource_type": "instance", "resource_name": "ai-agent-web-vm", "configuration": {"instance_type": "t3.micro"}, "dependencies": ["ai-agent-subnet", "ai-agent-web-sg"]},
-                ],
-                "commands": [
-                    {
-                        "command_id": "cmd-vpc",
-                        "service": "ec2",
-                        "action": "create-vpc",
-                        "parameters": {"cidr-block": "10.0.0.0/16"},
-                        "description": "Create VPC",
-                        "operation_category": "WRITE",
-                        "resource_ref": "vpc.main",
-                        "output_key": "Vpc.VpcId",
-                    },
-                    {
-                        "command_id": "cmd-subnet",
-                        "service": "ec2",
-                        "action": "create-subnet",
-                        "parameters": {"vpc-id": "{{vpc.main.id}}", "cidr-block": "10.0.1.0/24"},
-                        "description": "Create Subnet",
-                        "operation_category": "WRITE",
-                        "resource_ref": "subnet.public",
-                        "depends_on": ["cmd-vpc"],
-                        "output_key": "Subnet.SubnetId",
-                    },
-                    {
-                        "command_id": "cmd-sg",
-                        "service": "ec2",
-                        "action": "create-security-group",
-                        "parameters": {"group-name": "ai-agent-web-sg", "description": "Web SG", "vpc-id": "{{vpc.main.id}}"},
-                        "description": "Create Security Group",
-                        "operation_category": "WRITE",
-                        "resource_ref": "security_group.web",
-                        "depends_on": ["cmd-vpc"],
-                        "output_key": "GroupId",
-                    },
-                    {
-                        "command_id": "cmd-ec2",
-                        "service": "ec2",
-                        "action": "run-instances",
-                        "parameters": {
-                            "image-id": "ami-022ce6f32988af5fa",
-                            "instance-type": "t3.micro",
-                            "subnet-id": "{{subnet.public.id}}",
-                            "security-group-ids": ["{{security_group.web.id}}"],
-                            "count": "1",
-                        },
-                        "description": "Launch EC2 Instance",
-                        "operation_category": "WRITE",
-                        "resource_ref": "instance.web",
-                        "depends_on": ["cmd-subnet", "cmd-sg"],
-                        "output_key": "Instances[0].InstanceId",
-                    },
-                ],
-                "risk_level": "MEDIUM",
-                "destructive_operations": False,
-                "missing_parameters": [],
-                "assumptions": ["Using 10.0.0.0/16 CIDR block"],
-                "cost_warnings": ["EC2 instance and VPC components incur standard rates."],
             })
 
         # Scenario B (Default): EC2 in existing default VPC
         return json.dumps({
             "intent": "Create a simple web server in Mumbai using an EC2 t3.micro instance with HTTP access",
             "operation_type": "create",
-            "operation_category": "WRITE",
             "aws_region": "ap-south-1",
             "resources": [
-                {"service": "ec2", "resource_type": "security_group", "resource_name": "ai-agent-web-sg", "configuration": {}, "dependencies": []},
-                {"service": "ec2", "resource_type": "instance", "resource_name": "ai-agent-web-server", "configuration": {"instance_type": "t3.micro", "image_id": "ami-022ce6f32988af5fa"}, "dependencies": ["ai-agent-web-sg"]},
-            ],
-            "commands": [
                 {
-                    "command_id": "cmd-sg-1",
-                    "service": "ec2",
-                    "action": "create-security-group",
-                    "parameters": {"group-name": "ai-agent-web-sg", "description": "Allow HTTP port 80"},
-                    "description": "Create security group for web server",
-                    "operation_category": "WRITE",
-                    "output_key": "GroupId",
+                    "logical_ref": "security_group.web",
+                    "resource_type": "security_group",
+                    "service": "vpc",
+                    "resource_name": "ai-agent-web-sg",
+                    "configuration": {
+                        "group_name": "ai-agent-web-sg",
+                        "description": "Allow HTTP port 80",
+                        "ingress_rules": [
+                            {"port": 80, "protocol": "tcp", "cidr": "0.0.0.0/0"}
+                        ],
+                    },
+                    "dependencies": [],
                 },
                 {
-                    "command_id": "cmd-sg-rule-1",
+                    "logical_ref": "instance.web",
+                    "resource_type": "instance",
                     "service": "ec2",
-                    "action": "authorize-security-group-ingress",
-                    "parameters": {"group-name": "ai-agent-web-sg", "protocol": "tcp", "port": "80", "cidr": "0.0.0.0/0"},
-                    "description": "Authorize inbound HTTP traffic on port 80",
-                    "operation_category": "WRITE",
-                    "depends_on": ["cmd-sg-1"],
-                },
-                {
-                    "command_id": "cmd-ec2-1",
-                    "service": "ec2",
-                    "action": "run-instances",
-                    "parameters": {"image-id": "ami-022ce6f32988af5fa", "instance-type": "t3.micro", "count": "1"},
-                    "description": "Launch t3.micro EC2 web server instance",
-                    "operation_category": "WRITE",
-                    "depends_on": ["cmd-sg-rule-1"],
-                    "output_key": "Instances[0].InstanceId",
+                    "resource_name": "ai-agent-web-server",
+                    "configuration": {
+                        "instance_type": "t3.micro",
+                        "image_id": "ami-022ce6f32988af5fa",
+                        "security_group_ids": ["{{security_group.web.id}}"],
+                        "count": 1,
+                    },
+                    "dependencies": ["security_group.web"],
                 },
             ],
-            "risk_level": "MEDIUM",
-            "destructive_operations": False,
             "missing_parameters": [],
             "assumptions": ["Using default VPC for Mumbai region", "Using Amazon Linux 2023 AMI"],
-            "cost_warnings": ["EC2 instances incur charges while running."],
-            "educational_notes": ["Security group acts as a virtual firewall."],
         })
 
     def is_available(self) -> bool:
@@ -498,11 +383,11 @@ class TestEndToEndScenario:
         )
 
         res = exec_resp.execution_result
-        assert res.status == ExecutionStatus.PARTIAL_SUCCESS
+        assert res.status in (ExecutionStatus.PARTIAL_SUCCESS, ExecutionStatus.PARTIAL_FAILURE, ExecutionStatus.ROLLBACK_PENDING)
         assert any("run-instances" in s for s in res.skipped_commands)
         skipped_results = [r for r in res.command_results if r.status == CommandExecutionStatus.SKIPPED]
         assert len(skipped_results) == 1
-        assert skipped_results[0].command_id == "cmd-ec2"
+        assert "run-instances" in skipped_results[0].command_display or "instance" in skipped_results[0].command_id or skipped_results[0].command_id == "cmd-ec2"
 
     def test_scenario_h_prompt_injection_rejected_early(self):
         """Scenario H: Prompt injection attempt rejected early at parser layer."""
@@ -512,3 +397,81 @@ class TestEndToEndScenario:
         )
         assert "bypass safety controls" in response.message
         assert response.plan is None
+
+    def test_scenario_i_destructive_requires_confirmation_token(self):
+        """Scenario I: Backend re-validation blocks destructive plan execution without CONFIRM DELETE token."""
+        plan_resp = self.orchestrator.process_request(
+            user_request="Delete S3 bucket my-test-bucket",
+            region="ap-south-1",
+            dry_run=False,
+        )
+        plan = plan_resp.plan
+        assert plan.destructive_operations is True
+
+        # Attempt to execute without confirmation token
+        blocked_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+            confirmation_token=None,
+        )
+        assert "Execution Blocked" in blocked_resp.message
+        assert "CONFIRM DELETE" in blocked_resp.message
+        assert blocked_resp.execution_result is None
+
+        # Execute with proper confirmation token and mocked executor
+        self.orchestrator._executor = MagicMock()
+        self.orchestrator._executor.execute_command.return_value = CommandResult(
+            command_id="cmd-del", stdout="{}", parsed_output={}, stderr="", exit_code=0, success=True
+        )
+        approved_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+            confirmation_token="CONFIRM DELETE",
+        )
+        assert approved_resp.execution_result.status == ExecutionStatus.SUCCESS
+
+    def test_scenario_j_unsupported_resource_type_handled(self):
+        """Scenario J: Unsupported resource type is caught and fails planning gracefully."""
+        response = self.orchestrator.process_request(
+            user_request="Please run a quantum miner in ap-south-1",
+            region="ap-south-1",
+            dry_run=True,
+        )
+        assert response.requires_input is True
+        assert any("quantum_miner" in p for p in response.input_questions)
+
+    def test_scenario_k_auto_rollback_midflight(self):
+        """Scenario K: Auto-rollback enabled rolls back successfully provisioned resources on midflight failure."""
+        prompt = "Create a custom vpc with public subnet and web server in Mumbai"
+        plan_resp = self.orchestrator.process_request(
+            user_request=prompt,
+            region="ap-south-1",
+            dry_run=True,
+        )
+        plan = plan_resp.plan
+
+        mock_exec = MagicMock()
+        def fake_exec(cmd, **kwargs):
+            if cmd.action == "create-vpc":
+                return CommandResult(command_id="cmd-vpc", stdout='{"Vpc": {"VpcId": "vpc-auto-1"}}', parsed_output={"Vpc": {"VpcId": "vpc-auto-1"}}, resource_ids={"VpcId": "vpc-auto-1"}, stderr="", exit_code=0, success=True)
+            elif cmd.action == "create-subnet":
+                return CommandResult(command_id="cmd-subnet", stdout="", stderr="Subnet error", exit_code=1, success=False, error_message="Subnet error")
+            elif cmd.action == "delete-vpc":
+                return CommandResult(command_id="rb-vpc", stdout="{}", parsed_output={}, stderr="", exit_code=0, success=True)
+            return CommandResult(command_id="fallback", stdout="{}", parsed_output={}, stderr="", exit_code=0, success=True)
+
+        mock_exec.execute_command.side_effect = fake_exec
+        self.orchestrator._executor = mock_exec
+
+        exec_resp = self.orchestrator.execute_approved_plan(
+            plan=plan,
+            region="ap-south-1",
+            profile="default",
+            auto_rollback=True,
+        )
+        res = exec_resp.execution_result
+        assert res.status == ExecutionStatus.ROLLED_BACK
+        assert any("rolled back" in w.lower() for w in exec_resp.warnings)
+

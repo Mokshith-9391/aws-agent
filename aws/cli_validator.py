@@ -19,12 +19,19 @@ logger = logging.getLogger(__name__)
 
 # Deterministic prefixes for operation categories
 READ_ONLY_PREFIXES = (
-    "describe-", "list-", "get-", "head-", "check-", "lookup-", "select-", "scan", "query"
+    "describe-", "list-", "get-", "head-", "check-", "lookup-", "select-", "scan", "query",
+    "filter-", "receive-message", "presign", "assume-role"
 )
 
 DESTRUCTIVE_PREFIXES = (
     "delete-", "terminate-", "remove-", "revoke-", "deregister-",
-    "detach-", "disassociate-", "release-", "purge-", "drop-", "destroy-"
+    "detach-", "disassociate-", "release-", "purge-", "drop-", "destroy-", "unsubscribe"
+)
+
+WRITE_PREFIXES = (
+    "create-", "run-", "modify-", "update-", "put-", "associate-", "attach-", "authorize-",
+    "start-", "stop-", "reboot-", "add-", "allocate-", "register-", "apply-", "enable-",
+    "disable-", "set-", "replace-", "send-", "publish-", "invoke", "subscribe", "tag-", "website"
 )
 
 # Explicit action overrides where prefix alone is ambiguous
@@ -69,8 +76,12 @@ def classify_aws_action(service: str, action: str) -> OperationCategory:
     if any(action_norm.startswith(p) for p in READ_ONLY_PREFIXES):
         return OperationCategory.READ_ONLY
 
-    # 4. Default to WRITE
-    return OperationCategory.WRITE
+    # 4. Check write prefixes
+    if any(action_norm.startswith(p) for p in WRITE_PREFIXES):
+        return OperationCategory.WRITE
+
+    # 5. Reject unclassified actions
+    raise ValueError(f"Unrecognized AWS action '{action}' for service '{service}'. Cannot deterministically classify.")
 
 
 class CLICommandValidator:
@@ -102,22 +113,26 @@ class CLICommandValidator:
         issues: list[str] = []
 
         # ── 1. Authoritative Category Check ────────────────────────
-        deterministic_category = self.classify_operation(cmd.service, cmd.action)
-        if cmd.operation_category != deterministic_category:
-            logger.warning(
-                "Command '%s %s' had LLM-declared category '%s', overriding to authoritative '%s'",
-                cmd.service, cmd.action, cmd.operation_category, deterministic_category
-            )
-            # Never allow downgrading a destructive command to WRITE
-            cmd.operation_category = deterministic_category
+        try:
+            deterministic_category = self.classify_operation(cmd.service, cmd.action)
+            if cmd.operation_category != deterministic_category:
+                logger.warning(
+                    "Command '%s %s' had LLM-declared category '%s', overriding to authoritative '%s'",
+                    cmd.service, cmd.action, cmd.operation_category, deterministic_category
+                )
+                # Never allow downgrading a destructive command to WRITE
+                cmd.operation_category = deterministic_category
+        except ValueError as e:
+            issues.append(str(e))
+            return False, issues
 
         # ── 2. Allowlist Checks ────────────────────────────────────
-        if cmd.service not in ALLOWED_SERVICES:
+        if cmd.service not in ALLOWED_ACTIONS:
             issues.append(f"Service '{cmd.service}' not in allowlist.")
             return False, issues
 
         allowed = ALLOWED_ACTIONS.get(cmd.service, set())
-        if cmd.action not in allowed:
+        if not allowed or cmd.action not in allowed:
             issues.append(f"Action '{cmd.action}' not in allowlist for service '{cmd.service}'.")
             return False, issues
 

@@ -69,24 +69,26 @@ class ResourceVerifier:
         rtype = resource_type.lower().strip()
 
         # Route to specific verification strategy based on service & resource_type
-        if svc == "ec2" and rtype == "instance":
+        if (svc in ("ec2", "vpc")) and rtype == "instance":
             return self._verify_ec2_instance(resource_id, region, profile, resource_ref)
-        elif svc == "ec2" and rtype == "vpc":
+        elif (svc in ("ec2", "vpc")) and rtype == "vpc":
             return self._verify_vpc(resource_id, region, profile, resource_ref)
-        elif svc == "ec2" and rtype == "subnet":
+        elif (svc in ("ec2", "vpc")) and rtype == "subnet":
             return self._verify_subnet(resource_id, region, profile, resource_ref)
-        elif svc == "ec2" and rtype == "security_group":
+        elif (svc in ("ec2", "vpc")) and rtype in ("security_group", "security-group", "sg"):
             return self._verify_security_group(resource_id, region, profile, resource_ref)
-        elif svc == "ec2" and rtype in ("internet_gateway", "igw"):
+        elif (svc in ("ec2", "vpc")) and rtype in ("internet_gateway", "internet-gateway", "igw"):
             return self._verify_internet_gateway(resource_id, region, profile, resource_ref)
-        elif svc == "ec2" and rtype in ("route_table", "rtb"):
+        elif (svc in ("ec2", "vpc")) and rtype in ("route_table", "route-table", "rtb"):
             return self._verify_route_table(resource_id, region, profile, resource_ref)
         elif svc in ("s3", "s3api") and rtype == "bucket":
             return self._verify_s3_bucket(resource_id, region, profile, resource_ref)
         elif svc == "dynamodb" and rtype == "table":
             return self._verify_dynamodb_table(resource_id, region, profile, resource_ref)
-        elif svc == "iam" and rtype == "role":
+        elif svc == "iam" and rtype in ("role", "iam_role"):
             return self._verify_iam_role(resource_id, region, profile, resource_ref)
+        elif svc == "iam" and rtype in ("policy", "iam_policy"):
+            return self._verify_iam_policy(resource_id, region, profile, resource_ref)
         elif svc == "lambda" and rtype == "function":
             return self._verify_lambda_function(resource_id, region, profile, resource_ref)
         elif svc == "rds" and rtype == "db_instance":
@@ -362,6 +364,32 @@ class ResourceVerifier:
             resource_ref=resource_ref, resource_type="role", service="iam",
             resource_id=role_name, verified=False, state="NOT_FOUND",
             message=f"IAM role {role_name} not found.",
+        )
+
+    def _verify_iam_policy(
+        self, policy_arn: str, region: str, profile: str, resource_ref: Optional[str]
+    ) -> VerificationResult:
+        cmd = CLICommand(
+            service="iam",
+            action="get-policy",
+            parameters={"policy-arn": policy_arn},
+            description=f"Verify IAM policy {policy_arn}",
+            operation_category=OperationCategory.READ_ONLY,
+        )
+        res = self.executor.execute_command(cmd, region=region, profile=profile)
+        if res.success and res.parsed_output:
+            pol = res.parsed_output.get("Policy", {})
+            arn = pol.get("Arn", "")
+            return VerificationResult(
+                resource_ref=resource_ref, resource_type="policy", service="iam",
+                resource_id=policy_arn, verified=bool(arn), state="ACTIVE",
+                details={"Arn": arn, "PolicyId": pol.get("PolicyId")},
+                message=f"IAM policy verified: {arn}",
+            )
+        return VerificationResult(
+            resource_ref=resource_ref, resource_type="policy", service="iam",
+            resource_id=policy_arn, verified=False, state="NOT_FOUND",
+            message=f"IAM policy {policy_arn} not found.",
         )
 
     def _verify_lambda_function(

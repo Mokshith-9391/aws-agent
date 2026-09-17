@@ -101,6 +101,25 @@ class AWSServiceRegistry:
         svc = self._services.get(service_name)
         return svc.cli_service if svc else None
 
+    def find_resource_type(self, resource_type: str) -> Optional[tuple[str, ResourceTypeDefinition]]:
+        """Find the service name and ResourceTypeDefinition for a given resource_type string."""
+        rtype_norm = resource_type.lower().strip()
+        for svc_name, svc_def in self._services.items():
+            if rtype_norm in svc_def.resource_types:
+                return svc_name, svc_def.resource_types[rtype_norm]
+        return None
+
+    def deduce_resource_type(self, service: str, action: str) -> Optional[str]:
+        """Deduce resource type from CLI service and action."""
+        svc_norm = service.lower().strip()
+        act_norm = action.lower().strip()
+        for svc_def in self._services.values():
+            if svc_def.cli_service == svc_norm or svc_def.service_name == svc_norm:
+                for rtype, rt_def in svc_def.resource_types.items():
+                    if act_norm in (rt_def.create_action, rt_def.describe_action, rt_def.delete_action, rt_def.list_action):
+                        return rtype
+        return None
+
     def get_all_resource_definitions(self) -> list[ResourceTypeDefinition]:
         """Get all registered resource type definitions."""
         return list(self._resource_type_map.values())

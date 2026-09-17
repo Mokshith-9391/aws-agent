@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from agent.models import CLICommand, OperationCategory
 from services.registry import (
     AWSServiceRegistry,
     ResourceTypeDefinition,
@@ -27,6 +28,79 @@ logger = logging.getLogger(__name__)
 SERVICE_NAME = "dynamodb"
 CLI_SERVICE = "dynamodb"
 SERVICE_DESCRIPTION = "Amazon DynamoDB"
+
+# ──────────────────────────────────────────────
+# Deterministic Command Builders
+# ──────────────────────────────────────────────
+
+def build_create_table_command(
+    table_name: str,
+    key_schema: list[dict[str, str]],
+    attribute_definitions: list[dict[str, str]],
+    billing_mode: str = "PAY_PER_REQUEST",
+    tags: Optional[list[dict[str, str]]] = None,
+    command_id: Optional[str] = None,
+    resource_ref: str = "dynamodb.table",
+) -> CLICommand:
+    """Deterministically construct a create-table command."""
+    params: dict[str, Any] = {
+        "table-name": table_name,
+        "key-schema": key_schema,
+        "attribute-definitions": attribute_definitions,
+        "billing-mode": billing_mode,
+    }
+    if tags:
+        params["tags"] = tags
+
+    cmd = CLICommand(
+        command_id=command_id or "cmd-ddb-create-table",
+        service="dynamodb",
+        action="create-table",
+        parameters=params,
+        description=f"Create DynamoDB table '{table_name}'",
+        operation_category=OperationCategory.WRITE,
+        resource_ref=resource_ref,
+        output_key="TableDescription.TableArn",
+    )
+    cmd.rollback_command = build_delete_table_command(
+        table_name=table_name,
+        resource_ref=resource_ref,
+    )
+    return cmd
+
+
+def build_delete_table_command(
+    table_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a delete-table command."""
+    return CLICommand(
+        command_id=command_id or "cmd-ddb-delete-table",
+        service="dynamodb",
+        action="delete-table",
+        parameters={"table-name": table_name},
+        description=f"Delete DynamoDB table '{table_name}'",
+        operation_category=OperationCategory.DESTRUCTIVE,
+        resource_ref=resource_ref,
+    )
+
+
+def build_describe_table_command(
+    table_name: str,
+    command_id: Optional[str] = None,
+    resource_ref: Optional[str] = None,
+) -> CLICommand:
+    """Deterministically construct a describe-table verification command."""
+    return CLICommand(
+        command_id=command_id or "cmd-ddb-describe-table",
+        service="dynamodb",
+        action="describe-table",
+        parameters={"table-name": table_name},
+        description=f"Verify DynamoDB table '{table_name}'",
+        operation_category=OperationCategory.READ_ONLY,
+        resource_ref=resource_ref,
+    )
 
 # ──────────────────────────────────────────────
 # Pydantic Parameter Models
