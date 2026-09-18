@@ -36,7 +36,7 @@ from services.ec2 import (
     build_terminate_instances_command,
     build_create_key_pair_command,
 )
-from services.registry import AWSServiceRegistry, ResourceTypeDefinition
+from services.registry import AWSServiceRegistry, ResourceTypeDefinition, AmbiguousResourceTypeError
 from services.s3 import (
     build_create_bucket_command,
     build_delete_bucket_command,
@@ -83,6 +83,36 @@ class UnsupportedConfigurationError(ValueError):
     pass
 
 
+class RawAwsIdRejectionError(ValueError):
+    """Raised when the LLM provides a raw AWS resource ID in a CREATE desired-state plan.
+
+    B3: LLM output for CREATE/MUTATION plans must use only:
+    - Logical references (e.g. '{{vpc.main.id}}')
+    - Names, CIDRs, or other configuration strings
+    - Placeholder patterns resolved by the compiler
+
+    Raw AWS IDs (vpc-xxx, subnet-xxx, sg-xxx, ami-xxx, etc.) may only appear in
+    DELETE plans where they refer to existing resources the user has explicitly named.
+    """
+    pass
+
+
+class DuplicateLogicalRefError(ValueError):
+    """Raised when two resources in a desired-state plan have the same logical_ref.
+
+    B4: All logical refs must be unique within a plan so dependency edges are unambiguous.
+    """
+    pass
+
+
+class MissingLogicalRefError(ValueError):
+    """Raised when a resource dependency points to a logical_ref not defined in the plan.
+
+    B4: Pass 1 indexes all logical refs; any dependency pointing to an undefined ref is rejected.
+    """
+    pass
+
+
 RESOURCE_CONFIG_SCHEMAS: dict[tuple[str, str], set[str]] = {
     ("ec2", "instance"): {
         "instance_type", "instance-type",
@@ -93,7 +123,9 @@ RESOURCE_CONFIG_SCHEMAS: dict[tuple[str, str], set[str]] = {
         "count",
         "name",
         "architecture",
-        "image_id", "image-id",
+        # NOTE: image_id is intentionally excluded.
+        # The compiler uses its own AMI discovery (AMIDiscovery) to determine the image_id.
+        # LLM-provided AMI IDs are rejected by design (B3 invariant).
     },
     ("ec2", "key_pair"): {
         "key_name", "key-name",
@@ -232,7 +264,23 @@ class PlanCompiler:
         ref_to_command_id: dict[str, str] = {}
 
         # ── 1. Validate All Resource Types & Configuration Schemas ────
+        # This is Pass 1 of the two-pass compilation (B4).
+        # We validate all resource types and build the logical ref index BEFORE
+        # compiling any commands. This ensures forward dependencies are caught early.
         validated_resources: list[tuple[DesiredResource, str, ResourceTypeDefinition]] = []
+
+        # B4 Pass 1a: Validate uniqueness of logical_ref across all resources
+        seen_refs: set[str] = set()
+        for res in desired.resources:
+            ref = res.logical_ref
+            if ref in seen_refs:
+                raise DuplicateLogicalRefError(
+                    f"Duplicate logical_ref '{ref}' found in desired-state plan. "
+                    f"All logical references must be unique within a plan."
+                )
+            seen_refs.add(ref)
+
+        # B4 Pass 1b: Validate and index all resource type lookups
         for res in desired.resources:
             lookup = None
             if res.service:
@@ -240,7 +288,11 @@ class PlanCompiler:
                 if rt_def:
                     lookup = (res.service, rt_def)
             if not lookup:
-                lookup = self.registry.find_resource_type(res.resource_type)
+                # B5: find_resource_type raises AmbiguousResourceTypeError on ambiguous matches
+                try:
+                    lookup = self.registry.find_resource_type(res.resource_type, service=res.service)
+                except AmbiguousResourceTypeError:
+                    raise
 
             if not lookup:
                 raise UnsupportedResourceTypeError(
@@ -273,9 +325,31 @@ class PlanCompiler:
                     f"Allowed fields: {sorted(allowed_keys)}"
                 )
 
+            # B3: Reject raw AWS resource IDs in CREATE/MUTATION configurations.
+            # Raw IDs (vpc-xxx, subnet-xxx, sg-xxx, ami-xxx) must not appear in LLM-generated
+            # desired-state for CREATE plans. Only logical refs or compiler-derived values allowed.
+            if desired.operation_type not in (OperationType.DELETE, OperationType.LIST, OperationType.DESCRIBE):
+                self._reject_raw_aws_ids_in_create_config(cfg, svc_key, rtype_key)
+
             validated_resources.append((res, lookup[0], lookup[1]))
 
-        # ── 2. Compile Resources into Commands & Logical Resources ───
+        # B4 Pass 1c: Validate all dependency references point to defined logical refs
+        for res in desired.resources:
+            for dep_ref in res.dependencies:
+                if dep_ref not in seen_refs:
+                    raise MissingLogicalRefError(
+                        f"Resource '{res.logical_ref}' depends on '{dep_ref}', "
+                        f"but '{dep_ref}' is not defined in this desired-state plan. "
+                        f"Defined refs: {sorted(seen_refs)}"
+                    )
+
+        # ── 2. Pass 2: Compile Resources into Commands & Logical Resources ───
+        # Pre-assign authoritative command IDs for all resources so forward dependencies resolve
+        ref_to_command_id: dict[str, str] = {
+            (res.logical_ref or f"{svc_name}.{res.resource_type}_{idx}"): f"cmd-{svc_name}-{res.resource_type}-{uuid.uuid4().hex[:6]}"
+            for idx, (res, svc_name, _) in enumerate(validated_resources, 1)
+        }
+
         for idx, (res, svc_name, rt_def) in enumerate(validated_resources, 1):
             ref = res.logical_ref or f"{svc_name}.{res.resource_type}_{idx}"
             cfg = res.configuration or {}
@@ -315,14 +389,14 @@ class PlanCompiler:
             if rt_def.cost_warning and rt_def.cost_warning not in cost_warnings:
                 cost_warnings.append(rt_def.cost_warning)
 
-            # Determine command-level dependency IDs
+            # Determine command-level dependency IDs using pre-assigned IDs (handles forward deps)
             dep_command_ids = [
                 ref_to_command_id[dep]
                 for dep in res.dependencies
                 if dep in ref_to_command_id
             ]
 
-            cmd_id = f"cmd-{svc_name}-{res.resource_type}-{uuid.uuid4().hex[:6]}"
+            cmd_id = ref_to_command_id[ref]
 
             # ── Dispatch to Deterministic Builders ───────────────────
             op_type = desired.operation_type
@@ -359,13 +433,18 @@ class PlanCompiler:
                     if not c.region:
                         c.region = region
                     commands.append(c)
-                    ref_to_command_id[ref] = c.command_id
 
                 if ver_cmd:
                     ver_cmd.profile = profile
                     if not ver_cmd.region:
                         ver_cmd.region = region
                     verification_steps.append(ver_cmd)
+
+        # Topological sorting & cycle detection
+        if len(commands) > 1:
+            from agent.dependency_graph import DependencyGraph
+            dep_graph = DependencyGraph(commands)
+            commands = dep_graph.topological_sort()
 
         # ── 3. Deterministic Operation Category & Risk Level ─────────
         if any(cmd.operation_category == OperationCategory.DESTRUCTIVE for cmd in commands):
@@ -433,6 +512,67 @@ class PlanCompiler:
         )
         plan.plan_hash = plan.compute_plan_fingerprint()
         return plan
+
+    @staticmethod
+    def _reject_raw_aws_ids_in_create_config(
+        cfg: dict[str, Any], svc_key: str, rtype_key: str
+    ) -> None:
+        """Reject raw AWS resource IDs in CREATE/MUTATION desired-state configuration.
+
+        B3: The LLM must not provide hardcoded AWS resource IDs (vpc-xxx, subnet-xxx,
+        sg-xxx, ami-xxx) in CREATE plans. These indicate the LLM is trying to reference
+        existing AWS resources by their real IDs, which is only allowed for DELETE plans
+        where the user has explicitly named a resource.
+
+        Logical references ({{ref.id}}) and user-supplied names/CIDRs are allowed.
+
+        Args:
+            cfg: Desired-state configuration dict from LLM.
+            svc_key: Service key (e.g., 'ec2', 'vpc').
+            rtype_key: Resource type key (e.g., 'instance', 'subnet').
+
+        Raises:
+            RawAwsIdRejectionError: If any value looks like a hardcoded AWS resource ID.
+        """
+        import re
+
+        # Patterns that indicate raw AWS resource IDs (not logical refs)
+        RAW_ID_PATTERNS = [
+            (re.compile(r'^vpc-[0-9a-f]{8,17}$'), "VPC ID"),
+            (re.compile(r'^subnet-[0-9a-f]{8,17}$'), "Subnet ID"),
+            (re.compile(r'^sg-[0-9a-f]{8,17}$'), "Security Group ID"),
+            (re.compile(r'^ami-[0-9a-f]{8,17}$'), "AMI ID"),
+            (re.compile(r'^igw-[0-9a-f]{8,17}$'), "Internet Gateway ID"),
+            (re.compile(r'^rtb-[0-9a-f]{8,17}$'), "Route Table ID"),
+            (re.compile(r'^i-[0-9a-f]{8,17}$'), "Instance ID"),
+            (re.compile(r'^eni-[0-9a-f]{8,17}$'), "Network Interface ID"),
+            (re.compile(r'^vol-[0-9a-f]{8,17}$'), "Volume ID"),
+            (re.compile(r'^snap-[0-9a-f]{8,17}$'), "Snapshot ID"),
+        ]
+
+        def _check_value(key: str, val: Any) -> None:
+            if not isinstance(val, str):
+                return
+            val_stripped = val.strip()
+            # Allow logical reference placeholders
+            if "{{" in val_stripped and "}}" in val_stripped:
+                return
+            for pattern, id_type in RAW_ID_PATTERNS:
+                if pattern.match(val_stripped):
+                    raise RawAwsIdRejectionError(
+                        f"B3 Violation: LLM provided a raw {id_type} ('{val_stripped}') "
+                        f"in field '{key}' for CREATE resource '{svc_key}.{rtype_key}'. "
+                        f"CREATE plans must use logical references (e.g., '{{{{vpc.main.id}}}}') "
+                        f"or configuration names/CIDRs, not hardcoded AWS resource IDs. "
+                        f"Raw IDs are only permitted in DELETE configurations."
+                    )
+
+        for key, value in cfg.items():
+            if isinstance(value, list):
+                for item in value:
+                    _check_value(key, item)
+            else:
+                _check_value(key, value)
 
     def _compile_create_resource(
         self,

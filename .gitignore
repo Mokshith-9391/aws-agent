@@ -37,7 +37,12 @@ history/data/
 .DS_Store
 Thumbs.db
 
+# RAG Store
+rag_store/
+.pytest_cache/
+
 # Secrets
 *.pem
 *.key
 credentials
+

@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     # --- Testing & Integration ---
     AWS_INTEGRATION_TESTS: bool = False
 
+    # --- RAG & Company Knowledge ---
+    EMBEDDING_PROVIDER: str = "sentence_transformer"
+    EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+    VECTOR_STORE_PATH: str = "./rag_store"
+    RAG_TOP_K: int = 5
+    RAG_CHUNK_SIZE: int = 800
+    RAG_CHUNK_OVERLAP: int = 100
+    RAG_SIMILARITY_THRESHOLD: float = 0.30
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

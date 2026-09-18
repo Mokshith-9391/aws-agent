@@ -239,14 +239,18 @@ def build_plan_prompt(
     region: str = "ap-south-1",
     conversation_history: str = "",
     session_resources: str = "None",
+    rag_context: Optional[str] = None,
 ) -> str:
-    """Build the plan generation prompt."""
-    return PLAN_GENERATION_PROMPT.format(
+    """Build the plan generation prompt with optional RAG context."""
+    prompt = PLAN_GENERATION_PROMPT.format(
         user_request=user_request,
         region=region,
         conversation_history=conversation_history,
         session_resources=session_resources,
     )
+    if rag_context and rag_context.strip():
+        prompt += f"\n\n{rag_context}\n"
+    return prompt
 
 
 def build_explanation_prompt(

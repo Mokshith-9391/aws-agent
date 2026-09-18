@@ -298,7 +298,8 @@ def render_sidebar():
 
         # Session resources
         if st.session_state.orchestrator:
-            resources = st.session_state.orchestrator.get_session_resources()
+            get_res_fn = getattr(st.session_state.orchestrator, "get_session_resources", None)
+            resources = get_res_fn() if callable(get_res_fn) else {}
             if resources:
                 st.subheader("📦 Session Resources")
                 for rtype, rid in resources.items():
@@ -313,7 +314,7 @@ def render_sidebar():
                 st.session_state.messages = []
                 st.session_state.pending_plan = None
                 st.session_state.pending_approval_type = None
-                if st.session_state.orchestrator:
+                if st.session_state.orchestrator and hasattr(st.session_state.orchestrator, "clear_session"):
                     st.session_state.orchestrator.clear_session()
                 st.rerun()
         with col2:
@@ -383,7 +384,7 @@ def handle_user_input(user_input: str):
     # Check if this is a confirmation for explicit approval
     if st.session_state.pending_plan and st.session_state.pending_approval_type == "explicit_confirmation":
         if user_input.strip().upper() == "CONFIRM DELETE":
-            execute_pending_plan()
+            execute_pending_plan(confirmation_token="CONFIRM DELETE")
             return
         else:
             st.session_state.messages.append({
@@ -504,7 +505,7 @@ def render_approval_controls():
                 dry_run_pending_plan()
 
 
-def execute_pending_plan():
+def execute_pending_plan(confirmation_token: Optional[str] = None):
     """Execute the pending approved plan with explicit profile and region."""
     plan = st.session_state.pending_plan
     if not plan:
@@ -523,12 +524,19 @@ def execute_pending_plan():
         "content": f"⚡ **Executing approved plan using profile `{st.session_state.aws_profile}` and region `{st.session_state.aws_region}`...**",
     })
 
+    # B1 requirement: generate authoritative ApprovalToken for non-auto plans
+    token = None
+    if plan.operation_category != OperationCategory.READ_ONLY:
+        token = orchestrator._approval_manager.create_approval_token(plan)
+
     with st.spinner("🚀 Executing AWS commands..."):
         response = orchestrator.execute_approved_plan(
             plan=plan,
             region=st.session_state.aws_region,
             profile=st.session_state.aws_profile,
             learning_mode=st.session_state.learning_mode,
+            confirmation_token=confirmation_token,
+            approval_token=token,
         )
 
     st.session_state.pending_plan = None
@@ -722,7 +730,8 @@ def render_history():
         st.info("Agent not initialized. No history available.")
         return
 
-    entries = orchestrator.get_execution_history(limit=20)
+    get_hist_fn = getattr(orchestrator, "get_execution_history", None)
+    entries = get_hist_fn(limit=20) if callable(get_hist_fn) else []
     if not entries:
         st.info("No execution history yet.")
         return
@@ -760,6 +769,132 @@ def render_history():
 
 
 # ──────────────────────────────────────────────
+# Company Knowledge Base (RAG) Panels
+# ──────────────────────────────────────────────
+
+def render_knowledge_query():
+    """Render the company knowledge query tab."""
+    st.subheader("📚 Company Document Knowledge Base")
+    st.caption("Ask questions about company architecture standards, security policies, tagging rules, and runbooks.")
+
+    orchestrator = st.session_state.orchestrator
+    if not orchestrator or not orchestrator.rag_service:
+        st.warning("⚠️ RAG Knowledge service is not initialized. Click 'Initialize Agent' in the sidebar.")
+        return
+
+    rag_service = orchestrator.rag_service
+    doc_count = len(rag_service.list_documents())
+    chunk_count = rag_service.document_count()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.metric("Indexed Documents", doc_count)
+    with col2:
+        st.metric("Searchable Chunks", chunk_count)
+
+    st.markdown("---")
+
+    col_q, col_dept, col_k = st.columns([3, 1, 1])
+    with col_dept:
+        dept_options = ["All Departments", "Security", "Infrastructure", "Compliance", "Finance", "DevOps"]
+        selected_dept = st.selectbox("Filter Department", dept_options, index=0)
+        dept_filter = None if selected_dept == "All Departments" else selected_dept
+    with col_k:
+        top_k = st.number_input("Max Sources", min_value=1, max_value=10, value=3)
+
+    with col_q:
+        query_text = st.text_input("Ask a question:", placeholder="e.g., What are the mandatory tags for EC2 instances?")
+
+    if st.button("🔍 Search Knowledge Base", type="primary"):
+        if not query_text.strip():
+            st.warning("Please enter a question.")
+            return
+
+        with st.spinner("Searching company documents..."):
+            answer = rag_service.query(query_text, top_k=top_k, department=dept_filter)
+
+        if answer.grounded:
+            st.success("✅ Grounded in Company Documents")
+            st.markdown(f"### Answer\n\n{answer.answer}")
+
+            if answer.citations:
+                st.markdown("### 📑 Sources & Citations")
+                for i, c in enumerate(answer.citations, 1):
+                    with st.expander(f"{i}. {c.filename} (Confidence: {c.similarity_score:.0%})"):
+                        if c.department:
+                            st.markdown(f"**Department:** {c.department}")
+                        if c.page_number:
+                            st.markdown(f"**Page:** {c.page_number}")
+                        if c.section:
+                            st.markdown(f"**Section:** {c.section}")
+                        st.markdown(f"> *{c.excerpt}*")
+        else:
+            st.info(f"ℹ️ {answer.answer}")
+
+
+def render_document_management():
+    """Render the document upload and index management tab."""
+    st.subheader("📄 Document Management")
+    st.caption("Upload company policies, architecture runbooks, and SOPs for RAG ingestion.")
+
+    orchestrator = st.session_state.orchestrator
+    if not orchestrator or not orchestrator.rag_service:
+        st.warning("⚠️ RAG Knowledge service is not initialized. Click 'Initialize Agent' in the sidebar.")
+        return
+
+    rag_service = orchestrator.rag_service
+
+    with st.form("doc_upload_form", clear_on_submit=True):
+        col_up, col_d = st.columns([3, 1])
+        with col_up:
+            uploaded_file = st.file_uploader(
+                "Select a document to ingest",
+                type=["pdf", "docx", "txt", "md"],
+                help="Supported formats: PDF, DOCX, TXT, Markdown",
+            )
+        with col_d:
+            dept = st.selectbox("Department", ["General", "Security", "Infrastructure", "Compliance", "Finance", "DevOps"])
+
+        submit_btn = st.form_submit_button("📥 Upload & Index Document", type="primary")
+
+        if submit_btn and uploaded_file:
+            staging_dir = os.path.join(os.path.dirname(__file__), "data", "company_docs")
+            os.makedirs(staging_dir, exist_ok=True)
+            save_path = os.path.join(staging_dir, uploaded_file.name)
+
+            with open(save_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+
+            with st.spinner(f"Ingesting and chunking '{uploaded_file.name}'..."):
+                try:
+                    doc = rag_service.ingest_document(save_path, department=dept)
+                    st.success(f"Indexed **{doc.filename}**: {doc.chunk_count} chunks indexed (Hash: `{doc.doc_id[:12]}`).")
+                except Exception as e:
+                    st.error(f"Failed to ingest document: {e}")
+
+    st.markdown("---")
+    st.subheader("📑 Currently Indexed Documents")
+
+    docs = rag_service.list_documents()
+    if not docs:
+        st.info("No documents currently indexed in the knowledge base.")
+    else:
+        for doc in docs:
+            col_info, col_del = st.columns([5, 1])
+            with col_info:
+                st.markdown(
+                    f"📄 **{doc.filename}** ({doc.document_type.upper()}) — "
+                    f"Dept: `{doc.department or 'General'}` | Chunks: `{doc.chunk_count}` | "
+                    f"ID: `{doc.doc_id[:10]}...`"
+                )
+            with col_del:
+                if st.button("🗑️ Remove", key=f"del_{doc.doc_id}"):
+                    rag_service.delete_document(doc.doc_id)
+                    st.toast(f"Removed {doc.filename}")
+                    st.rerun()
+
+
+# ──────────────────────────────────────────────
 # Main Application
 # ──────────────────────────────────────────────
 
@@ -768,15 +903,20 @@ def main():
     # Render sidebar
     render_sidebar()
 
-    # Check if history panel should be shown
-    if st.session_state.get("show_history", False):
-        tab1, tab2 = st.tabs(["💬 Chat", "📋 History"])
-        with tab1:
-            render_chat()
-        with tab2:
-            render_history()
-    else:
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "💬 Provisioning Agent",
+        "📚 Company Knowledge",
+        "📄 Document Management",
+        "📋 Execution History",
+    ])
+    with tab1:
         render_chat()
+    with tab2:
+        render_knowledge_query()
+    with tab3:
+        render_document_management()
+    with tab4:
+        render_history()
 
 
 if __name__ == "__main__":

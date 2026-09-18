@@ -22,7 +22,7 @@ class ResourceTypeDefinition:
     """Definition of a single AWS resource type within a service."""
     service: str
     resource_type: str
-    cli_service: str  # The AWS CLI service name (e.g., 'ec2', 's3api')
+    cli_service: str
     description: str
     create_action: Optional[str] = None
     describe_action: Optional[str] = None
@@ -30,7 +30,7 @@ class ResourceTypeDefinition:
     list_action: Optional[str] = None
     required_params: list[str] = field(default_factory=list)
     optional_params: list[str] = field(default_factory=list)
-    id_field: Optional[str] = None  # JSON path to resource ID in create output
+    id_field: Optional[str] = None
     name_tag_key: str = "Name"
     supports_tags: bool = True
     cost_warning: Optional[str] = None
@@ -51,6 +51,22 @@ class ServiceDefinition:
         self.resource_types[resource_type.resource_type] = resource_type
 
 
+class AmbiguousResourceTypeError(ValueError):
+    """Raised when a resource_type matches multiple services without an explicit service hint.
+
+    B5: The compiler must fail with an explicit error rather than silently picking
+    the first match. The caller must supply an explicit 'service' field to disambiguate.
+    """
+
+    def __init__(self, resource_type: str, matching_services: list[str]) -> None:
+        super().__init__(
+            "Resource type '" + resource_type + "' is ambiguous: found in services " + str(matching_services) + ". "
+            "Specify 'service' explicitly in the desired-state resource to disambiguate."
+        )
+        self.resource_type = resource_type
+        self.matching_services = matching_services
+
+
 class AWSServiceRegistry:
     """
     Central registry for all supported AWS services.
@@ -68,9 +84,9 @@ class AWSServiceRegistry:
         """Register a service definition."""
         self._services[service_def.service_name] = service_def
         for rt_name, rt_def in service_def.resource_types.items():
-            key = f"{service_def.service_name}.{rt_name}"
+            key = service_def.service_name + "." + rt_name
             self._resource_type_map[key] = rt_def
-        logger.debug(f"Registered service: {service_def.service_name} with {len(service_def.resource_types)} resource types")
+        logger.debug("Registered service: %s with %d resource types", service_def.service_name, len(service_def.resource_types))
 
     def get_service(self, service_name: str) -> Optional[ServiceDefinition]:
         """Get a service definition by name."""
@@ -78,7 +94,7 @@ class AWSServiceRegistry:
 
     def get_resource_type(self, service: str, resource_type: str) -> Optional[ResourceTypeDefinition]:
         """Get a resource type definition."""
-        key = f"{service}.{resource_type}"
+        key = service + "." + resource_type
         return self._resource_type_map.get(key)
 
     def is_service_supported(self, service_name: str) -> bool:
@@ -101,13 +117,44 @@ class AWSServiceRegistry:
         svc = self._services.get(service_name)
         return svc.cli_service if svc else None
 
-    def find_resource_type(self, resource_type: str) -> Optional[tuple[str, ResourceTypeDefinition]]:
-        """Find the service name and ResourceTypeDefinition for a given resource_type string."""
+    def find_resource_type(
+        self, resource_type: str, service: Optional[str] = None
+    ) -> Optional[tuple[str, ResourceTypeDefinition]]:
+        """Find the service name and ResourceTypeDefinition for a given resource_type string.
+
+        B5: Raises AmbiguousResourceTypeError when multiple services provide this resource_type
+        and no service hint is given. Previously returned the first match silently.
+
+        Args:
+            resource_type: The resource type string (e.g. 'vpc', 'instance').
+            service: Optional explicit service hint to disambiguate.
+
+        Returns:
+            (service_name, ResourceTypeDefinition) tuple or None if not found.
+
+        Raises:
+            AmbiguousResourceTypeError: If multiple services provide this resource_type.
+        """
         rtype_norm = resource_type.lower().strip()
+
+        # If explicit service is provided, try exact lookup first
+        if service:
+            svc_def = self._services.get(service)
+            if svc_def and rtype_norm in svc_def.resource_types:
+                return service, svc_def.resource_types[rtype_norm]
+
+        # Search all services for matches
+        matches: list[tuple[str, ResourceTypeDefinition]] = []
         for svc_name, svc_def in self._services.items():
             if rtype_norm in svc_def.resource_types:
-                return svc_name, svc_def.resource_types[rtype_norm]
-        return None
+                matches.append((svc_name, svc_def.resource_types[rtype_norm]))
+
+        if len(matches) == 0:
+            return None
+        elif len(matches) == 1:
+            return matches[0]
+        else:
+            raise AmbiguousResourceTypeError(resource_type, [m[0] for m in matches])
 
     def deduce_resource_type(self, service: str, action: str) -> Optional[str]:
         """Deduce resource type from CLI service and action."""
@@ -165,5 +212,5 @@ def create_default_registry() -> AWSServiceRegistry:
     register_rds_service(registry)
     register_ecs_service(registry)
 
-    logger.info(f"Service registry initialized with {len(registry.list_services())} services")
+    logger.info("Service registry initialized with %d services", len(registry.list_services()))
     return registry

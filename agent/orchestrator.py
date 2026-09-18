@@ -89,6 +89,7 @@ class AgentOrchestrator:
         # Session state
         self._conversation_history: list[dict] = []
         self._resource_context = ResourceContext()
+        self._rag_service: Optional[Any] = None
 
     def initialize(self) -> tuple[bool, str]:
         """Initialize the orchestrator and all subsystems."""
@@ -102,6 +103,23 @@ class AgentOrchestrator:
             self._planner = Planner(self._llm_client, self._registry)
             self._explainer = Explainer(self._llm_client)
 
+            # Initialize RAG Service (isolated knowledge layer)
+            try:
+                from rag.service import RAGService
+                self._rag_service = RAGService(
+                    vector_store_path=self._settings.VECTOR_STORE_PATH,
+                    embedding_provider=self._settings.EMBEDDING_PROVIDER,
+                    embedding_model=self._settings.EMBEDDING_MODEL,
+                    top_k=self._settings.RAG_TOP_K,
+                    similarity_threshold=self._settings.RAG_SIMILARITY_THRESHOLD,
+                    chunk_size=self._settings.RAG_CHUNK_SIZE,
+                    chunk_overlap=self._settings.RAG_CHUNK_OVERLAP,
+                    llm_client=self._llm_client,
+                )
+            except Exception as re:
+                logger.warning("RAG service initialization deferred or failed: %s", re)
+                self._rag_service = None
+
             self._initialized = True
             logger.info("Agent orchestrator initialized successfully")
             return True, "Agent initialized successfully"
@@ -113,7 +131,36 @@ class AgentOrchestrator:
 
     @property
     def is_initialized(self) -> bool:
+        """Check if the orchestrator is initialized."""
         return self._initialized
+
+    @property
+    def rag_service(self) -> Optional[Any]:
+        """Access the company document RAG service (knowledge only)."""
+        return self._rag_service
+
+    @property
+    def initialization_error(self) -> str:
+        """Get the initialization error message if any."""
+        return self._init_error
+
+    def get_session_resources(self) -> dict[str, str]:
+        """Return a mapping of tracked session resources (label -> AWS resource ID)."""
+        result: dict[str, str] = {}
+        for res in self._resource_context.list_resources():
+            if res.resource_id:
+                label = f"{res.service}:{res.resource_type} ({res.resource_ref})" if res.service else res.resource_ref
+                result[label] = res.resource_id
+        return result
+
+    def clear_session(self) -> None:
+        """Clear conversation history and reset session resource context."""
+        self._conversation_history.clear()
+        self._resource_context = ResourceContext()
+
+    def get_execution_history(self, limit: int = 20) -> list[ExecutionHistoryEntry]:
+        """Retrieve recent execution history entries from the history store."""
+        return self._history_store.list_entries(limit=limit)
 
     def process_request(
         self,
@@ -177,8 +224,17 @@ class AgentOrchestrator:
         effective_region = hints.get("detected_region") or region
         effective_profile = profile
 
-        # ── Step 2: Pre-flight Resource Discovery ────────────────────
+        # ── Step 2: Pre-flight Resource Discovery & RAG Policy Context ────
         discovered_text = self._discover_existing_resources(region=effective_region, profile=effective_profile)
+
+        # Retrieve relevant company policy context if RAG service is active
+        # CRITICAL: This is informational context only. It cannot authorize actions or commands.
+        rag_context = None
+        if self._rag_service:
+            try:
+                rag_context = self._rag_service.get_planning_context(sanitized_input)
+            except Exception as e:
+                logger.debug("RAG policy retrieval skipped: %s", e)
 
         # ── Step 3: Plan Generation (Reasoning Layer) ─────────────────
         plan = self._planner.generate_plan(
@@ -189,6 +245,7 @@ class AgentOrchestrator:
             conversation_history=self._conversation_history,
             session_resources={r.resource_ref: r.resource_id for r in self._resource_context.list_resources() if r.resource_id},
             existing_resources=discovered_text,
+            rag_context=rag_context,
         )
 
         # Check for planning failure
@@ -353,7 +410,26 @@ class AgentOrchestrator:
 
         # ── Step 0: Plan Fingerprint Re-validation (Tamper Detection) ───
         current_hash = plan.compute_plan_fingerprint()
-        if plan.plan_hash and plan.plan_hash != current_hash:
+
+        # B2: Fail-closed on missing or empty plan_hash — no bypass path
+        if not plan.plan_hash or not plan.plan_hash.strip():
+            logger.error(
+                "Plan %s rejected: plan_hash is missing or empty. "
+                "All plans must have a deterministic fingerprint before execution.",
+                plan.plan_id,
+            )
+            return AgentResponse(
+                message=(
+                    "❌ **Execution Blocked: plan_hash Missing**\n"
+                    "This plan does not have a deterministic SHA-256 fingerprint. "
+                    "Execution is refused. Resubmit the plan through the full "
+                    "planning pipeline to generate a valid fingerprint."
+                ),
+                plan=plan,
+                warnings=["plan_hash is missing or empty — execution fails closed for safety."],
+            )
+
+        if plan.plan_hash != current_hash:
             logger.error(
                 "Plan %s fingerprint mismatch: compiled=%s, current=%s",
                 plan.plan_id,
@@ -367,7 +443,34 @@ class AgentOrchestrator:
             )
 
         # ── Step 0b: Approval Token & Confirmation Validation ─────────
-        if approval_token:
+        # B1: ApprovalToken is MANDATORY for ALL non-AUTO plans.
+        # AUTO plans are read-only and do not require tokens.
+        # STANDARD and EXPLICIT_CONFIRMATION plans MUST have a valid token.
+        approval_req = self._approval_manager.determine_approval_requirement(plan)
+        effective_approval_type = approval_req.get("approval_type", plan.approval_type)
+
+        if effective_approval_type != ApprovalType.AUTO:
+            if not approval_token:
+                logger.error(
+                    "Plan %s blocked: ApprovalToken is required for approval_type='%s' but was not provided.",
+                    plan.plan_id,
+                    effective_approval_type,
+                )
+                return AgentResponse(
+                    message=(
+                        f"❌ **Execution Blocked: ApprovalToken Required**\n"
+                        f"This plan requires `{effective_approval_type.value}` approval. "
+                        f"An ApprovalToken must be provided to authorize execution.\n"
+                        f"Generate a token by calling `ApprovalManager.create_approval_token(plan)` "
+                        f"after human review."
+                    ),
+                    plan=plan,
+                    approval_type=effective_approval_type,
+                    warnings=[
+                        f"ApprovalToken required for '{effective_approval_type.value}' plan but not provided."
+                    ],
+                )
+
             token_valid, token_issues = self._approval_manager.validate_approval(
                 plan=plan,
                 token=approval_token,
@@ -380,17 +483,6 @@ class AgentOrchestrator:
                     plan=plan,
                     warnings=token_issues,
                 )
-        else:
-            approval_req = self._approval_manager.determine_approval_requirement(plan)
-            if approval_req.get("approval_type") == ApprovalType.EXPLICIT_CONFIRMATION or plan.approval_type == ApprovalType.EXPLICIT_CONFIRMATION:
-                if not confirmation_token or confirmation_token.strip().upper() != "CONFIRM DELETE":
-                    logger.warning("Plan %s blocked: explicit confirmation token 'CONFIRM DELETE' missing or incorrect", plan.plan_id)
-                    return AgentResponse(
-                        message="❌ **Execution Blocked**: This operation involves destructive actions and requires explicit confirmation. Please provide confirmation token 'CONFIRM DELETE'.",
-                        plan=plan,
-                        approval_type=ApprovalType.EXPLICIT_CONFIRMATION,
-                        warnings=["Explicit confirmation token 'CONFIRM DELETE' required."],
-                    )
 
         # ── Step 0c: Live Mode Safety Gate Pre-Check ──────────────────
         self._safety_gate._executor = self._executor

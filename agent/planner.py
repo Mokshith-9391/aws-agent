@@ -70,19 +70,21 @@ class Planner:
         account_id: str = "Unknown",
         profile: str = "default",
         conversation_history: list[dict] = None,
-        session_resources: dict[str, str] = None,
+        session_resources: Optional[dict[str, str]] = None,
         existing_resources: str = "None discovered",
+        rag_context: Optional[str] = None,
     ) -> ProvisioningPlan:
-        """Generate a provisioning plan from a natural-language request.
+        """Generate a complete provisioning plan from a natural-language request.
 
         Args:
-            user_request: Natural language request.
+            user_request: Natural-language request from user.
             region: Target AWS region.
             account_id: AWS account ID for context.
             profile: Target AWS CLI profile.
             conversation_history: Prior conversation turns.
             session_resources: Known session resource IDs.
             existing_resources: Summary of discovered resources.
+            rag_context: Optional company policy context from RAG.
 
         Returns:
             A validated ProvisioningPlan with deterministic command classifications.
@@ -118,6 +120,7 @@ class Planner:
             region=region,
             conversation_history=history_text,
             session_resources=resources_text,
+            rag_context=rag_context,
         )
 
         try:
