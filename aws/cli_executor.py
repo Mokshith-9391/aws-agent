@@ -253,7 +253,10 @@ class AWSCLIExecutor:
             )
 
         # ── 4. Build Command Args with Profile & Region ────
-        eff_profile = profile or cmd.profile or getattr(self.settings, "AWS_PROFILE", "default")
+        # AgentCore supplies short-lived execution-role credentials. An AWS_PROFILE
+        # would make the CLI search a non-existent local credentials file.
+        runtime_mode = bool(getattr(self.settings, "AGENTCORE_RUNTIME", False))
+        eff_profile = None if runtime_mode else (profile or cmd.profile or getattr(self.settings, "AWS_PROFILE", "default"))
         eff_region = region or cmd.region or getattr(self.settings, "AWS_REGION", "ap-south-1")
 
         args = cmd.to_cli_args(profile=eff_profile, region=eff_region)

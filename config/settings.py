@@ -24,6 +24,7 @@ class LLMProvider(str, Enum):
     GOOGLE = "google"
     AZURE_OPENAI = "azure_openai"
     OLLAMA = "ollama"
+    BEDROCK = "bedrock"
 
 
 class ExecutionMode(str, Enum):
@@ -49,12 +50,17 @@ class Settings(BaseSettings):
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 8192
     LLM_BASE_URL: Optional[str] = None
+    BEDROCK_MODEL_ID: Optional[str] = None
 
     # --- AWS ---
     AWS_PROFILE: str = "default"
     AWS_REGION: str = "ap-south-1"
     AWS_CLI_TIMEOUT: int = 120  # seconds
     AWS_CLI_PATH: str = "aws"
+    # AgentCore tasks use the execution role's rotating credentials. Profiles are
+    # intentionally not passed to subprocesses in that environment.
+    AGENTCORE_RUNTIME: bool = False
+    AGENTCORE_EXECUTION_ENABLED: bool = False
 
     # --- Execution ---
     DEFAULT_EXECUTION_MODE: ExecutionMode = ExecutionMode.DRY_RUN
@@ -71,6 +77,9 @@ class Settings(BaseSettings):
     # --- History ---
     HISTORY_DIR: str = "history"
     MAX_HISTORY_ENTRIES: int = 500
+    HISTORY_BACKEND: str = "local"  # local | dynamodb
+    DYNAMODB_HISTORY_TABLE: Optional[str] = None
+    DYNAMODB_HISTORY_TIMESTAMP_INDEX: Optional[str] = None
 
     # --- Security ---
     ENABLE_PROMPT_INJECTION_PROTECTION: bool = True
@@ -93,6 +102,8 @@ class Settings(BaseSettings):
     RAG_CHUNK_SIZE: int = 800
     RAG_CHUNK_OVERLAP: int = 100
     RAG_SIMILARITY_THRESHOLD: float = 0.30
+    RAG_BACKEND: str = "local"  # local | bedrock_knowledge_base
+    BEDROCK_KNOWLEDGE_BASE_ID: Optional[str] = None
 
     model_config = {
         "env_file": ".env",
@@ -110,7 +121,7 @@ class Settings(BaseSettings):
     ) -> dict[str, str]:
         """Get environment variables for AWS CLI subprocess calls with explicit profile and region overrides."""
         env = os.environ.copy()
-        effective_profile = profile or self.AWS_PROFILE
+        effective_profile = "" if self.AGENTCORE_RUNTIME else (profile or self.AWS_PROFILE)
         effective_region = region or self.AWS_REGION
 
         if effective_profile and effective_profile.strip():

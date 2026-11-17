@@ -2,6 +2,10 @@
 
 # ☁️ AWS Resource Provisioning AI Agent
 
+> **AgentCore deployment:** [deployment design and configuration](docs/AGENTCORE_DEPLOYMENT.md)
+> covers the ARM64 runtime container, Bedrock integrations, DynamoDB history,
+> and separate Streamlit client. This repository does not create AWS resources.
+
 ### *Intelligent Natural-Language Cloud Infrastructure Provisioning with Hardened AWS CLI Execution*
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
