@@ -220,6 +220,37 @@ class OllamaLLMClient(LLMClient):
             return False
 
 
+class BedrockLLMClient(LLMClient):
+    """Amazon Bedrock Converse API provider using the runtime execution role."""
+
+    def __init__(self, model: str, region: str):
+        self._model = model
+        self._region = region
+        self._client = None
+
+    def _get_client(self):
+        if self._client is None:
+            import boto3
+            self._client = boto3.client("bedrock-runtime", region_name=self._region)
+        return self._client
+
+    def generate(self, system_prompt: str, user_prompt: str, temperature: float = 0.1,
+                 max_tokens: int = 8192, response_format: Optional[str] = None) -> str:
+        instruction = system_prompt
+        if response_format == "json":
+            instruction += "\nReturn only valid JSON."
+        response = self._get_client().converse(
+            modelId=self._model,
+            system=[{"text": instruction}],
+            messages=[{"role": "user", "content": [{"text": user_prompt}]}],
+            inferenceConfig={"temperature": temperature, "maxTokens": max_tokens},
+        )
+        return "".join(block.get("text", "") for block in response["output"]["message"]["content"])
+
+    def is_available(self) -> bool:
+        return bool(self._model)
+
+
 def create_llm_client(settings: Optional[Settings] = None) -> LLMClient:
     """Factory function to create the appropriate LLM client based on settings.
 
@@ -236,7 +267,10 @@ def create_llm_client(settings: Optional[Settings] = None) -> LLMClient:
         settings = get_settings()
 
     api_key = settings.LLM_API_KEY or ""
-    model = settings.LLM_MODEL
+    model = settings.BEDROCK_MODEL_ID or settings.LLM_MODEL
+
+    if settings.LLM_PROVIDER == LLMProvider.BEDROCK:
+        return BedrockLLMClient(model=model, region=settings.AWS_REGION)
 
     if settings.LLM_PROVIDER == LLMProvider.GOOGLE:
         if not api_key:

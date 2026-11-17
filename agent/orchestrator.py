@@ -81,7 +81,7 @@ class AgentOrchestrator:
         self._policy_engine = SafetyPolicyEngine()
         self._approval_manager = ApprovalManager()
         self._sanitizer = OutputSanitizer()
-        self._history_store = ExecutionStore()
+        self._history_store = self._create_history_store()
         self._rollback_engine = RollbackEngine(self._executor)
         self._registry: AWSServiceRegistry = create_default_registry()
         self._safety_gate = LiveModeSafetyGate(self._identity_manager, self._registry, executor=self._executor)
@@ -90,6 +90,12 @@ class AgentOrchestrator:
         self._conversation_history: list[dict] = []
         self._resource_context = ResourceContext()
         self._rag_service: Optional[Any] = None
+
+    def _create_history_store(self):
+        if self._settings.HISTORY_BACKEND.lower() == "dynamodb":
+            from history.dynamodb_store import DynamoDBExecutionStore
+            return DynamoDBExecutionStore(settings=self._settings)
+        return ExecutionStore(settings=self._settings)
 
     def initialize(self) -> tuple[bool, str]:
         """Initialize the orchestrator and all subsystems."""
@@ -105,8 +111,12 @@ class AgentOrchestrator:
 
             # Initialize RAG Service (isolated knowledge layer)
             try:
-                from rag.service import RAGService
-                self._rag_service = RAGService(
+                if self._settings.RAG_BACKEND.lower() == "bedrock_knowledge_base":
+                    from rag.bedrock_knowledge_service import BedrockKnowledgeService
+                    self._rag_service = BedrockKnowledgeService(settings=self._settings, llm_client=self._llm_client)
+                else:
+                    from rag.service import RAGService
+                    self._rag_service = RAGService(
                     vector_store_path=self._settings.VECTOR_STORE_PATH,
                     embedding_provider=self._settings.EMBEDDING_PROVIDER,
                     embedding_model=self._settings.EMBEDDING_MODEL,
@@ -114,8 +124,8 @@ class AgentOrchestrator:
                     similarity_threshold=self._settings.RAG_SIMILARITY_THRESHOLD,
                     chunk_size=self._settings.RAG_CHUNK_SIZE,
                     chunk_overlap=self._settings.RAG_CHUNK_OVERLAP,
-                    llm_client=self._llm_client,
-                )
+                        llm_client=self._llm_client,
+                    )
             except Exception as re:
                 logger.warning("RAG service initialization deferred or failed: %s", re)
                 self._rag_service = None
